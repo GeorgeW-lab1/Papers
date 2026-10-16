@@ -148,6 +148,66 @@ def die_permutation_test(counts, gx, gy, n_perm=999):
     return obs, null, p
 
 
+
+# ---------------- logic-gate detection ----------------
+# Per-die boolean inputs from defect counts, combined through logic gates.
+THRESH = {"Micropipe": 1, "TSD": 2, "BPD (clustered)": 3, "Scratch": 1}
+
+
+def die_flags(by_type, gx, gy):
+    """Boolean input vector per die: MP, TSD, BPD, SCR."""
+    f = {}
+    for k, v in by_type.items():
+        f[k] = die_counts(v, gx, gy) >= THRESH[k]
+    return f["Micropipe"], f["TSD"], f["BPD (clustered)"], f["Scratch"]
+
+
+def gate_network(mp, tsd, bpd, scr):
+    """
+    G_FATAL = MP OR SCR              (OR gate  : immediate kill)
+    G_RISK  = BPD AND TSD            (AND gate : co-located dislocations -> gate-oxide risk)
+    G_MIXED = BPD XOR TSD            (XOR gate : exactly one dislocation type present)
+    PASS    = NOT(G_FATAL OR G_RISK) (NOR gate : die ships)
+    """
+    g_fatal = np.logical_or(mp, scr)
+    g_risk = np.logical_and(bpd, tsd)
+    g_mixed = np.logical_xor(bpd, tsd)
+    passed = np.logical_not(np.logical_or(g_fatal, g_risk))
+    return g_fatal, g_risk, g_mixed, passed
+
+
+def detect_gate_pattern(mp, tsd, bpd, scr):
+    """Per-die: which gate(s) fired. Returns reason code array."""
+    g_fatal, g_risk, g_mixed, passed = gate_network(mp, tsd, bpd, scr)
+    code = np.full(len(mp), "PASS", dtype=object)
+    code[g_mixed & passed] = "XOR-only (pass, watch)"
+    code[g_risk] = "AND (BPD&TSD)"
+    code[g_fatal] = "OR (MP|SCR)"
+    return code
+
+
+def truth_table_coverage(mp, tsd, bpd, scr):
+    """Count dies for each of the 16 input combinations and the gate outputs."""
+    rows = []
+    idx = (mp * 8 + tsd * 4 + bpd * 2 + scr * 1).astype(int)
+    for i in range(16):
+        m, t, b, s = (i >> 3) & 1, (i >> 2) & 1, (i >> 1) & 1, i & 1
+        fatal, risk, mixed, ok = gate_network(*(np.array([x], bool) for x in (m, t, b, s)))
+        rows.append((m, t, b, s, int(fatal[0]), int(risk[0]), int(mixed[0]), int(ok[0]), int((idx == i).sum())))
+    return rows
+
+
+def cooccurrence_permutation_test(bpd, tsd, n_perm=999):
+    """
+    Is the AND gate (BPD & TSD) firing more often than if the two flags were
+    independent? Permute the TSD flag across die sites to break co-location.
+    """
+    obs = np.sum(bpd & tsd)
+    null = np.array([np.sum(bpd & rng.permutation(tsd)) for _ in range(n_perm)])
+    p = (1 + np.sum(null >= obs)) / (n_perm + 1)
+    return obs, null, p
+
+
 # ---------------- main ----------------
 if __name__ == "__main__":
     by_type, pts, labels = simulate_wafer()
@@ -167,8 +227,25 @@ if __name__ == "__main__":
     mi, mi_null, mi_p = die_permutation_test(counts, gx, gy)
     print(f"Moran's I (die counts)   : obs={mi:.3f}, null mean={mi_null.mean():.3f}, p={mi_p:.4f}")
 
+    # ---- logic-gate detection ----
+    mp, tsd, bpd, scr = die_flags(by_type, gx, gy)
+    g_fatal, g_risk, g_mixed, passed = gate_network(mp, tsd, bpd, scr)
+    codes = detect_gate_pattern(mp, tsd, bpd, scr)
+    print("\nGate network (die level):")
+    print(f"  OR  (MP|SCR)    fired: {g_fatal.sum()}")
+    print(f"  AND (BPD&TSD)   fired: {g_risk.sum()}")
+    print(f"  XOR (BPD^TSD)   fired: {g_mixed.sum()}")
+    print(f"  NOR PASS             : {passed.sum()}  -> gated yield {100*passed.mean():.1f}%")
+    print("  Reason codes:", {c: int((codes == c).sum()) for c in np.unique(codes)})
+    print("\n  MP TSD BPD SCR | FATAL RISK MIXED PASS | dies")
+    for r in truth_table_coverage(mp, tsd, bpd, scr):
+        if r[-1] > 0:
+            print(f"   {r[0]}   {r[1]}   {r[2]}   {r[3]}  |   {r[4]}     {r[5]}     {r[6]}     {r[7]}  | {r[8]}")
+    co_obs, co_null, co_p = cooccurrence_permutation_test(bpd, tsd)
+    print(f"  AND co-occurrence: obs={co_obs}, null mean={co_null.mean():.1f}, p={co_p:.4f}")
+
     # ---------------- plots ----------------
-    fig, ax = plt.subplots(2, 2, figsize=(12, 11))
+    fig, ax = plt.subplots(2, 3, figsize=(18, 11))
     theta = np.linspace(0, 2 * np.pi, 400)
 
     a = ax[0, 0]
@@ -197,6 +274,20 @@ if __name__ == "__main__":
     a.hist(mi_null, bins=40, color="lightgray")
     a.axvline(mi, c="r", label=f"observed (p={mi_p:.3f})")
     a.set_xlabel("Moran's I"); a.legend(); a.set_title("Permutation test: die-level autocorrelation")
+
+    a = ax[0, 2]
+    a.plot(R * np.cos(theta), R * np.sin(theta), "k")
+    cmap = {"PASS": "limegreen", "XOR-only (pass, watch)": "gold",
+            "AND (BPD&TSD)": "darkorange", "OR (MP|SCR)": "crimson"}
+    for c, col in cmap.items():
+        m = codes == c
+        a.scatter((gx + DIE / 2)[m], (gy + DIE / 2)[m], c=col, marker="s", s=38, label=f"{c} ({m.sum()})")
+    a.set_aspect("equal"); a.legend(fontsize=7, loc="upper right"); a.set_title("Logic-gate detection map")
+
+    a = ax[1, 2]
+    a.hist(co_null, bins=range(int(co_null.min()), int(max(co_null.max(), co_obs)) + 3), color="lightgray")
+    a.axvline(co_obs, c="r", label=f"observed (p={co_p:.3f})")
+    a.set_xlabel("dies with BPD AND TSD"); a.legend(); a.set_title("Permutation test: AND-gate co-occurrence")
 
     plt.tight_layout()
     plt.savefig("sic_wafer_defects.png", dpi=130)
