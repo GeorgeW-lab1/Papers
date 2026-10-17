@@ -1,3 +1,4 @@
+
 """
 SiC wafer: defects -> phonon measurements -> NAND-only macro dies running SHA-256.
 (Single-file version: defect simulation, Callaway/Raman phonon model, gate library
@@ -708,146 +709,464 @@ def tmr_vote(h1, h2, h3):
     return v.or_(v.and_(h1, h2), v.and_(x, h3))
 
 
+
+"""
+SHA-256 computed by PHONON-TRANSPORT (thermal) logic on the defective SiC wafer.
+
+Signals are TEMPERATURES, not bits:  logic 0 = 300 K (cold rail), logic 1 = 360 K (hot rail).
+Every NAND is a heat-flow network solved from energy balance at its output node:
+
+      T_hot --[ G_load ]--- (T_out) ---[ switch A + SiC segment A ]---[ switch B + SiC segment B ]--- T_cold
+
+   T_out = (G_load*T_hot + G_ch*T_cold) / (G_load + G_ch)
+
+   * G_SiC segment = kappa(T) * A / L     <- REAL phonon physics: Callaway model, evaluated at the
+                                              local temperature, with that die's measured defect
+                                              scattering (BPD ~w, TSD ~w^3, point ~w^4, Umklapp)
+   * switch conductance = thermal transistor / thermal switch (steep, thermally activated).
+                                              SiC alone has kappa FALLING with T (Umklapp), so it
+                                              cannot give gain; the switch is a PHENOMENOLOGICAL
+                                              stand-in (VO2-like), the one non-first-principles part.
+   * Each gate segment lands in one of three PHYSICAL states, sampled from the die's defect map:
+        bulk   : dislocation-scattered Callaway kappa
+        halo   : strain halo around micropipes/scratches (extra phonon scattering, MFP 0.3 um)
+        core   : hollow/cracked core (phonon boundary scattering, MFP 10 nm)
+     A segment with low kappa cannot pull the output node down -> the gate misreads. Faults are
+     therefore EMERGENT from phonon transport; nothing is injected by hand.
+   * Thermal noise on every node: sigma_T = sqrt(kB T^2 / C_node).
+
+The SHA-256 netlist is the same NAND-only one as before (verified against hashlib); only the
+gate physics changed. Needs sic_wafer_sha256_standalone.py in the same folder.
+"""
+import csv
+import hashlib
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+"""
+SHA-256 computed by PHONON-TRANSPORT (thermal) logic on the defective SiC wafer.
+
+Signals are TEMPERATURES, not bits:  logic 0 = 300 K (cold rail), logic 1 = 360 K (hot rail).
+Every NAND is a heat-flow network solved from energy balance at its output node:
+
+      T_hot --[ G_load ]--- (T_out) ---[ switch A + SiC segment A ]---[ switch B + SiC segment B ]--- T_cold
+
+   T_out = (G_load*T_hot + G_ch*T_cold) / (G_load + G_ch)
+
+   * G_SiC segment = kappa(T) * A / L     <- REAL phonon physics: Callaway model, evaluated at the
+                                              local temperature, with that die's measured defect
+                                              scattering (BPD ~w, TSD ~w^3, point ~w^4, Umklapp)
+   * switch conductance = thermal transistor / thermal switch (steep, thermally activated).
+                                              SiC alone has kappa FALLING with T (Umklapp), so it
+                                              cannot give gain; the switch is a PHENOMENOLOGICAL
+                                              stand-in (VO2-like), the one non-first-principles part.
+   * Each gate segment lands in one of three PHYSICAL states, sampled from the die's defect map:
+        bulk   : dislocation-scattered Callaway kappa
+        halo   : strain halo around micropipes/scratches (extra phonon scattering, MFP 0.3 um)
+        core   : hollow/cracked core (phonon boundary scattering, MFP 10 nm)
+     A segment with low kappa cannot pull the output node down -> the gate misreads. Faults are
+     therefore EMERGENT from phonon transport; nothing is injected by hand.
+   * Thermal noise on every node: sigma_T = sqrt(kB T^2 / C_node).
+
+The SHA-256 netlist is the same NAND-only one as before (verified against hashlib); only the
+gate physics changed. Needs sic_wafer_sha256_standalone.py in the same folder.
+"""
+import csv
+import hashlib
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 # ====================================================================
-# 4. Run
+# 1. Phonon physics: Callaway kappa(T) with defect scattering
+# ====================================================================
+ELL_CORE = 1e-8                      # m, phonon MFP inside a hollow/cracked core
+_pref0 = kB / (2 * np.pi ** 2 * V)
+
+
+def kappa_at(Tv, n_bpd, n_tsd, extra=0.0):
+    """Callaway kappa (W/mK) at temperature Tv; n_* in m^-2 arrays (one entry per die)."""
+    x = np.linspace(1e-3, THETA / Tv, 400)
+    w = x * kB * Tv / hbar
+    rate = (V / L_BND + A_PT * w ** 4 + B_UM * w ** 2 * Tv * np.exp(-THETA / (3 * Tv))
+            + C_BPD * n_bpd[:, None] * w + C_TSD * n_tsd[:, None] * w ** 3 / W_REF ** 2 + extra)
+    integ = x ** 4 * np.exp(x) / (np.exp(x) - 1) ** 2 / rate
+    return _cal * _pref0 * (kB * Tv / hbar) ** 3 * np.trapezoid(integ, x, axis=1)
+
+
+TGRID = np.linspace(290.0, 370.0, 17); DTG = TGRID[1] - TGRID[0]; NTG = len(TGRID)
+m_ = m_
+NB, NT_ = m_["n_bpd"] * 1e4, m_["n_tsd"] * 1e4
+KT = np.zeros((len(gx), NTG, 3))                                     # die x T x state(bulk,halo,core)
+for i, Tv in enumerate(TGRID):
+    KT[:, i, 0] = kappa_at(Tv, NB, NT_)
+    KT[:, i, 1] = kappa_at(Tv, NB, NT_, V / ELL_HALO)
+    KT[:, i, 2] = kappa_at(Tv, NB, NT_, V / ELL_CORE)
+RT = KT / KAPPA_PRISTINE                                             # relative conductance
+
+# physical state probabilities per die (area fractions)
+c_mp = die_counts(by_type["Micropipe"], gx, gy)
+c_sc = die_counts(by_type["Scratch"], gx, gy)
+A_CORE_MP = np.pi * 0.025 ** 2          # mm^2, 25 um radius micropipe core
+A_CORE_SC = 0.010 * (1 / 1.5)           # mm^2, 10 um wide x 0.67 mm per scratch marker
+P_CORE = np.clip((c_mp * A_CORE_MP + c_sc * A_CORE_SC) / DIE_AREA_MM2, 0, 1)
+P_HALO = np.clip(m_["f"] - P_CORE, 0, 1)
+
+# ====================================================================
+# 2. Thermal NAND gate (heat-balance network)
+# ====================================================================
+TC, TH = 300.0, 360.0                   # K, logic 0 / logic 1 rails
+T_TR, W_SW = 330.0, 3.0                 # K, switch threshold and transition width
+A_CH, L_CH = (50e-9) ** 2, 1e-6         # m^2, m   SiC channel segment geometry
+G_SEG0 = KAPPA_PRISTINE * A_CH / L_CH   # W/K, pristine SiC segment at 300 K
+G_ON, G_OFF = 50 * G_SEG0, 1e-3 * G_SEG0
+LN_RATIO = np.log(G_ON / G_OFF)
+LAMBDA = 0.21                           # G_load / G_SEG0  (ratioed-logic design knob)
+C_NODE = 2.2e6 * (100e-9) ** 3          # J/K, 100 nm SiC node
+SIGMA_T = np.sqrt(kB * 330.0 ** 2 / C_NODE)
+
+
+def switch_G(T):
+    s = 1.0 / (1.0 + np.exp(-(T - T_TR) / W_SW))
+    return G_OFF * np.exp(s * LN_RATIO)                  # log-interpolated off->on conductance
+
+
+def nand_T(Ta, Tb, rA, rB, lam=LAMBDA):
+    """Static output temperature of the thermal NAND. rA/rB: callables T_seg -> rel. SiC conductance."""
+    swA, swB = switch_G(Ta), switch_G(Tb)
+    Tseg = TC + 6.0
+    for _ in range(2):                                   # kappa(T) self-consistency
+        gA = 1.0 / (1.0 / swA + 1.0 / (G_SEG0 * rA(Tseg)))
+        gB = 1.0 / (1.0 / swB + 1.0 / (G_SEG0 * rB(Tseg)))
+        Gch = 1.0 / (1.0 / gA + 1.0 / gB)
+        To = (lam * G_SEG0 * TH + Gch * TC) / (lam * G_SEG0 + Gch)
+        Tseg = TC + 0.5 * (To - TC)
+    return To
+
+
+class ThermalFabric(Fabric):
+    """Same netlist interface as the Boolean fabric, but every gate is a thermal NAND."""
+    B = 1024
+
+    def __init__(self, SUB_all, real):
+        self.Mt = len(real); self.SUB, self.real = SUB_all, real.astype(float)
+        self.ar = np.arange(self.Mt); self.c = 0; self.cat = "misc"; self.s = None
+        self.LO, self.HI = np.full(self.Mt, TC), np.full(self.Mt, TH)
+        self.hit_core = np.zeros(self.Mt, int); self.hit_halo = np.zeros(self.Mt, int)
+        self.ptr = self.B; self.track = False
+
+    def stage(self, s):
+        if s == self.s: return
+        self.s = s; dd = self.SUB[:, s]
+        self.Rs = RT[dd]
+        self.pc, self.ph = P_CORE[dd] * self.real, P_HALO[dd] * self.real
+        self.pch = self.pc + self.ph
+
+    def _refill(self):
+        self.U = rng.random((self.B, 2, self.Mt)); self.Z = rng.standard_normal((self.B, self.Mt)); self.ptr = 0
+
+    def r_of(self, T, st):
+        x = (T - TGRID[0]) / DTG
+        i0 = np.clip(x.astype(int), 0, NTG - 2); w = x - i0
+        a = self.Rs[self.ar, i0, st]; b = self.Rs[self.ar, i0 + 1, st]
+        return a + (b - a) * w
+
+    def _arr(self, x):
+        return (self.HI if x else self.LO) if isinstance(x, (int, np.integer)) else x
+
+    def nand(self, a, b):
+        a, b = self._arr(a), self._arr(b)
+        if self.ptr == self.B: self._refill()
+        u, z = self.U[self.ptr], self.Z[self.ptr]; self.ptr += 1
+        stA = np.where(u[0] < self.pc, 2, np.where(u[0] < self.pch, 1, 0))
+        stB = np.where(u[1] < self.pc, 2, np.where(u[1] < self.pch, 1, 0))
+        self.hit_core += (stA == 2) + (stB == 2); self.hit_halo += (stA == 1) + (stB == 1)
+        To = nand_T(a, b, lambda T: self.r_of(T, stA), lambda T: self.r_of(T, stB))
+        self.c += 1
+        return To + SIGMA_T * z
+
+    def const(self, v): return [self.HI if (v >> k) & 1 else self.LO for k in range(32)]
+
+    def add(self, x, y):
+        carry, out = self.LO, []
+        for a, b in zip(x, y):
+            t = self.xor(a, b); out.append(self.xor(t, carry))
+            carry = self.or_(self.and_(a, b), self.and_(t, carry))
+        return out
+
+
+def to_digests(words8):
+    Tm = np.array(words8)                                # (8, 32, Mt) temperatures
+    bits = (Tm > T_TR).astype(np.uint64)
+    wts = (np.uint64(1) << np.arange(32, dtype=np.uint64))[None, :, None]
+    vals = (bits * wts).sum(1)                           # (8, Mt)
+    return [int("".join(f"{int(vals[w, m]):08x}" for w in range(8)), 16) for m in range(Tm.shape[2])], Tm
+
+# ====================================================================
+# 1. Phonon physics: Callaway kappa(T) with defect scattering
+# ====================================================================
+ELL_CORE = 1e-8                      # m, phonon MFP inside a hollow/cracked core
+_pref0 = kB / (2 * np.pi ** 2 * V)
+
+
+def kappa_at(Tv, n_bpd, n_tsd, extra=0.0):
+    """Callaway kappa (W/mK) at temperature Tv; n_* in m^-2 arrays (one entry per die)."""
+    x = np.linspace(1e-3, THETA / Tv, 400)
+    w = x * kB * Tv / hbar
+    rate = (V / L_BND + A_PT * w ** 4 + B_UM * w ** 2 * Tv * np.exp(-THETA / (3 * Tv))
+            + C_BPD * n_bpd[:, None] * w + C_TSD * n_tsd[:, None] * w ** 3 / W_REF ** 2 + extra)
+    integ = x ** 4 * np.exp(x) / (np.exp(x) - 1) ** 2 / rate
+    return _cal * _pref0 * (kB * Tv / hbar) ** 3 * np.trapezoid(integ, x, axis=1)
+
+
+TGRID = np.linspace(290.0, 370.0, 17); DTG = TGRID[1] - TGRID[0]; NTG = len(TGRID)
+m_ = m_
+NB, NT_ = m_["n_bpd"] * 1e4, m_["n_tsd"] * 1e4
+KT = np.zeros((len(gx), NTG, 3))                                     # die x T x state(bulk,halo,core)
+for i, Tv in enumerate(TGRID):
+    KT[:, i, 0] = kappa_at(Tv, NB, NT_)
+    KT[:, i, 1] = kappa_at(Tv, NB, NT_, V / ELL_HALO)
+    KT[:, i, 2] = kappa_at(Tv, NB, NT_, V / ELL_CORE)
+RT = KT / KAPPA_PRISTINE                                             # relative conductance
+
+# physical state probabilities per die (area fractions)
+c_mp = die_counts(by_type["Micropipe"], gx, gy)
+c_sc = die_counts(by_type["Scratch"], gx, gy)
+A_CORE_MP = np.pi * 0.025 ** 2          # mm^2, 25 um radius micropipe core
+A_CORE_SC = 0.010 * (1 / 1.5)           # mm^2, 10 um wide x 0.67 mm per scratch marker
+P_CORE = np.clip((c_mp * A_CORE_MP + c_sc * A_CORE_SC) / DIE_AREA_MM2, 0, 1)
+P_HALO = np.clip(m_["f"] - P_CORE, 0, 1)
+
+# ====================================================================
+# 2. Thermal NAND gate (heat-balance network)
+# ====================================================================
+TC, TH = 300.0, 360.0                   # K, logic 0 / logic 1 rails
+T_TR, W_SW = 330.0, 3.0                 # K, switch threshold and transition width
+A_CH, L_CH = (50e-9) ** 2, 1e-6         # m^2, m   SiC channel segment geometry
+G_SEG0 = KAPPA_PRISTINE * A_CH / L_CH   # W/K, pristine SiC segment at 300 K
+G_ON, G_OFF = 50 * G_SEG0, 1e-3 * G_SEG0
+LN_RATIO = np.log(G_ON / G_OFF)
+LAMBDA = 0.21                           # G_load / G_SEG0  (ratioed-logic design knob)
+C_NODE = 2.2e6 * (100e-9) ** 3          # J/K, 100 nm SiC node
+SIGMA_T = np.sqrt(kB * 330.0 ** 2 / C_NODE)
+
+
+def switch_G(T):
+    s = 1.0 / (1.0 + np.exp(-(T - T_TR) / W_SW))
+    return G_OFF * np.exp(s * LN_RATIO)                  # log-interpolated off->on conductance
+
+
+def nand_T(Ta, Tb, rA, rB, lam=LAMBDA):
+    """Static output temperature of the thermal NAND. rA/rB: callables T_seg -> rel. SiC conductance."""
+    swA, swB = switch_G(Ta), switch_G(Tb)
+    Tseg = TC + 6.0
+    for _ in range(2):                                   # kappa(T) self-consistency
+        gA = 1.0 / (1.0 / swA + 1.0 / (G_SEG0 * rA(Tseg)))
+        gB = 1.0 / (1.0 / swB + 1.0 / (G_SEG0 * rB(Tseg)))
+        Gch = 1.0 / (1.0 / gA + 1.0 / gB)
+        To = (lam * G_SEG0 * TH + Gch * TC) / (lam * G_SEG0 + Gch)
+        Tseg = TC + 0.5 * (To - TC)
+    return To
+
+
+class ThermalFabric(Fabric):
+    """Same netlist interface as the Boolean fabric, but every gate is a thermal NAND."""
+    B = 1024
+
+    def __init__(self, SUB_all, real):
+        self.Mt = len(real); self.SUB, self.real = SUB_all, real.astype(float)
+        self.ar = np.arange(self.Mt); self.c = 0; self.cat = "misc"; self.s = None
+        self.LO, self.HI = np.full(self.Mt, TC), np.full(self.Mt, TH)
+        self.hit_core = np.zeros(self.Mt, int); self.hit_halo = np.zeros(self.Mt, int)
+        self.ptr = self.B; self.track = False
+
+    def stage(self, s):
+        if s == self.s: return
+        self.s = s; dd = self.SUB[:, s]
+        self.Rs = RT[dd]
+        self.pc, self.ph = P_CORE[dd] * self.real, P_HALO[dd] * self.real
+        self.pch = self.pc + self.ph
+
+    def _refill(self):
+        self.U = rng.random((self.B, 2, self.Mt)); self.Z = rng.standard_normal((self.B, self.Mt)); self.ptr = 0
+
+    def r_of(self, T, st):
+        x = (T - TGRID[0]) / DTG
+        i0 = np.clip(x.astype(int), 0, NTG - 2); w = x - i0
+        a = self.Rs[self.ar, i0, st]; b = self.Rs[self.ar, i0 + 1, st]
+        return a + (b - a) * w
+
+    def _arr(self, x):
+        return (self.HI if x else self.LO) if isinstance(x, (int, np.integer)) else x
+
+    def nand(self, a, b):
+        a, b = self._arr(a), self._arr(b)
+        if self.ptr == self.B: self._refill()
+        u, z = self.U[self.ptr], self.Z[self.ptr]; self.ptr += 1
+        stA = np.where(u[0] < self.pc, 2, np.where(u[0] < self.pch, 1, 0))
+        stB = np.where(u[1] < self.pc, 2, np.where(u[1] < self.pch, 1, 0))
+        self.hit_core += (stA == 2) + (stB == 2); self.hit_halo += (stA == 1) + (stB == 1)
+        To = nand_T(a, b, lambda T: self.r_of(T, stA), lambda T: self.r_of(T, stB))
+        self.c += 1
+        return To + SIGMA_T * z
+
+    def const(self, v): return [self.HI if (v >> k) & 1 else self.LO for k in range(32)]
+
+    def add(self, x, y):
+        carry, out = self.LO, []
+        for a, b in zip(x, y):
+            t = self.xor(a, b); out.append(self.xor(t, carry))
+            carry = self.or_(self.and_(a, b), self.and_(t, carry))
+        return out
+
+
+def to_digests(words8):
+    Tm = np.array(words8)                                # (8, 32, Mt) temperatures
+    bits = (Tm > T_TR).astype(np.uint64)
+    wts = (np.uint64(1) << np.arange(32, dtype=np.uint64))[None, :, None]
+    vals = (bits * wts).sum(1)                           # (8, Mt)
+    return [int("".join(f"{int(vals[w, m]):08x}" for w in range(8)), 16) for m in range(Tm.shape[2])], Tm
+
+
+# ====================================================================
+# 3. Main
 # ====================================================================
 if __name__ == "__main__":
-    Wp = pack_blocks(MSGS)
+    # ---- phonon / gate characterisation ----
+    clean = int(np.argmin(NB + NT_ + P_CORE * 1e6 + P_HALO * 1e6))
+    dense = int(np.argmax(NB + NT_))
+    i300, i305 = 2, 3
+    print("Callaway kappa at 300 K (W/mK):")
+    print(f"   pristine bulk {KT[clean, i300, 0]:.0f} | dislocation-dense die {KT[dense, i300, 0]:.0f} | "
+          f"strain halo {KT[clean, i300, 1]:.0f} | hollow core {KT[clean, i300, 2]:.0f}")
+    print(f"   kappa(T) pristine: 300K {KT[clean,2,0]:.0f}  330K {KT[clean,8,0]:.0f}  360K {KT[clean,14,0]:.0f}  "
+          f"-> falls with T (Umklapp), so SiC alone has no gain; thermal switch supplies it")
+    rf = lambda st, d=clean: (lambda T: np.interp(T, TGRID, RT[d, :, st]))
+    Tin = np.linspace(295, 365, 281)
+    vtc = {n: nand_T(Tin, Tin, rf(st, d), rf(st, d)) for n, (st, d) in
+           {"pristine": (0, clean), "dislocation-dense": (0, dense), "strain halo": (1, clean), "hollow core": (2, clean)}.items()}
+    g = np.gradient(vtc["pristine"], Tin)
+    steep = Tin[g < -1]
+    VIL, VIH = steep.min(), steep.max()
+    VOL, VOH = vtc["pristine"][-1], vtc["pristine"][0]
+    print(f"\nThermal NAND (pristine SiC): V_OL={VOL:.1f} K  V_OH={VOH:.1f} K  max gain={abs(g.min()):.1f}")
+    print(f"   noise margins: NM_low={VIL - VOL:.1f} K  NM_high={VOH - VIH:.1f} K   (swing {TH - TC:.0f} K)")
+    for n in vtc: print(f"   NAND(1,1) low level, {n:<18}: {vtc[n][-1]:.1f} K  "
+                        f"({'OK' if vtc[n][-1] < T_TR - W_SW else 'FAILS -> reads as 1'})")
+    Gl = LAMBDA * G_SEG0
+    Gon = 1 / (1 / Gl + 2 / (G_SEG0 * 0.96 * 0.5 * 2))
+    tau_f, tau_r = C_NODE / (Gl + G_SEG0 * 0.48), C_NODE / Gl
+    P_on = (TH - TC) ** 2 * (Gl * G_SEG0 * 0.48 / (Gl + G_SEG0 * 0.48))
+    print(f"   delay: fall {tau_f*1e9:.1f} ns, rise {tau_r*1e9:.1f} ns | thermal noise sigma_T={SIGMA_T*1e3:.1f} mK")
+    print(f"   static heat flow when output pulled low: {P_on*1e3:.2f} mW/gate")
 
-    # ---- fault-free reference run (also counts gates + records stage segments) ----
-    fab0 = Fabric(M, track=True)
-    ref = extract(sha256_block(fab0, Wp), M)
-    assert ref == EXPECT, "NAND-only SHA-256 netlist does not match hashlib!"
-    N = fab0.c
-    bounds = [s for s, _ in fab0.segs] + [N]
-    segs = [(bounds[i], bounds[i + 1], fab0.segs[i][1]) for i in range(len(fab0.segs))]
-    print(f"NAND-only SHA-256 verified against hashlib on {M} macro dies")
-    print(f"Gate budget per macro die: {N:,} NAND2  (~{4 * N / 1e6:.1f} M transistors)")
-    for k, v in fab0.cats.items(): print(f"   {k:<11}: {v:>8,}  ({100 * v / N:4.1f}%)")
+    # ---- SHA-256 on the thermal fabric: wafer macro dies + 4 pristine reference macros ----
+    n_ref = 4
+    REF_MSGS = [f"reference thermal macro {i}" for i in range(n_ref)]
+    msgs_all = MSGS + REF_MSGS
+    exp_all = EXPECT + [int(hashlib.sha256(s.encode()).hexdigest(), 16) for s in REF_MSGS]
+    Mt = M + n_ref
+    SUB_all = np.vstack([SUB, np.full((n_ref, 4), clean)])
+    real = np.arange(Mt) < M
+    Wi = pack_blocks(msgs_all)
+    Wt = [[np.where(np.array([(x >> m) & 1 for m in range(Mt)], bool), TH, TC) for x in word] for word in Wi]
 
-    # ---- defective-wafer run ----
-    sched = build_schedule(segs, N)
-    print(f"\nInjected fault sites: {len(sched):,} gate instances across the wafer")
-    fab = Fabric(M, sched=sched)
-    got = extract(sha256_block(fab, Wp), M)
-    correct = np.array([g == e for g, e in zip(got, EXPECT)])
-    ham = np.array([bin(g ^ e).count("1") for g, e in zip(got, EXPECT)])
-
-    n_fatal = (fatal[SUB]).sum(1); n_soft = ((~fatal) & (risk | recheck))[SUB].sum(1)
-    cat = np.where(n_fatal > 0, "has FATAL sub-die", np.where(n_soft > 0, "soft faults only", "clean"))
-    print(f"\nSingle macro die: {correct.sum()}/{M} hashes correct ({100 * correct.mean():.1f}%)")
-    for c in ("clean", "soft faults only", "has FATAL sub-die"):
-        sel = cat == c
-        print(f"   {c:<18}: {correct[sel].sum():>3}/{sel.sum():<3} correct")
-    assert correct[cat == "clean"].all(), "a clean macro die produced a wrong hash"
+    fab = ThermalFabric(SUB_all, real)
+    print(f"\nRunning SHA-256 through {Mt} thermal macro dies ...")
+    got, Tm = to_digests(sha256_block(fab, Wt))
+    N = fab.c
+    ok = np.array([g_ == e for g_, e in zip(got, exp_all)])
+    print(f"Thermal NAND gates per macro die: {N:,}   (heat dissipated ~{N * 0.5 * P_on:.0f} W if half are pulling low)")
+    print(f"Pristine reference macros correct: {ok[M:].sum()}/{n_ref}")
+    assert ok[M:].all(), "thermal gates fail even on pristine SiC - adjust design (LAMBDA / W_SW)"
+    correct = ok[:M]
+    ham = np.array([bin(g_ ^ e).count("1") for g_, e in zip(got[:M], exp_all[:M])])
     wrong = ~correct
-    print(f"   wrong hashes: mean Hamming distance {ham[wrong].mean():.1f}/256 bits "
-          f"(avalanche ideal = 128)")
 
-    # ---- TMR ----
-    tmr_ok = []
-    for tr in TRIPLES:
-        voted = tmr_vote(got[tr[0]], got[tr[1]], got[tr[2]])
-        tmr_ok.append(voted == EXPECT[tr[0]])
-    tmr_ok = np.array(tmr_ok)
-    raw_in_triples = np.mean([correct[tr].mean() for tr in TRIPLES])
-    print(f"\nTMR triples: {len(TRIPLES)}   raw replica yield {100 * raw_in_triples:.1f}%  ->  "
-          f"voted yield {100 * tmr_ok.mean():.1f}%")
+    hard = (P_CORE[SUB] > 0).any(1); soft = ((P_HALO[SUB] > 0).any(1) | (NB[SUB] + NT_[SUB] > 0).any(1)) & ~hard
+    cat = np.where(hard, "hollow core / scratch", np.where(soft, "halo / dislocations only", "clean"))
+    print(f"\nWafer macro dies: {correct.sum()}/{M} hashes correct ({100 * correct.mean():.1f}%)")
+    for c in ("clean", "halo / dislocations only", "hollow core / scratch"):
+        s_ = cat == c
+        print(f"   {c:<26}: {correct[s_].sum():>3}/{s_.sum():<3} correct   "
+              f"(avg gate segments in core state {fab.hit_core[:M][s_].mean():.1f}, halo state {fab.hit_halo[:M][s_].mean():.0f})")
+    if wrong.any():
+        print(f"   wrong digests differ by {ham[wrong].mean():.1f}/256 bits on average (avalanche ideal 128)")
 
-    # ---- permutation test: does defect clustering help macro-die yield? ----
-    def clean_frac(fat): return np.mean(~fat[SUB].any(1))
-    obs = clean_frac(fatal)
-    n_perm = 999
-    null_ring, null_glob = [], []
-    for _ in range(n_perm):
-        p = np.arange(len(gx))
-        for g in RINGS: p[g] = rng.permutation(g)
-        null_ring.append(clean_frac(fatal[p]))
-        null_glob.append(clean_frac(fatal[rng.permutation(len(gx))]))
-    null_ring, null_glob = np.array(null_ring), np.array(null_glob)
-    p_ring = (1 + np.sum(null_ring >= obs)) / (n_perm + 1)
-    p_glob = (1 + np.sum(null_glob >= obs)) / (n_perm + 1)
-    print(f"\nFault-free macro-die fraction: observed {100 * obs:.1f}%")
-    print(f"   vs ring-shuffled defects : null {100 * null_ring.mean():.1f}%  p(obs>=null)={p_ring:.4f}")
-    print(f"   vs fully scattered       : null {100 * null_glob.mean():.1f}%  p(obs>=null)={p_glob:.4f}")
+    tmr_ok = np.array([tmr_vote(got[a], got[b], got[c]) == exp_all[a] for a, b, c in TRIPLES])
+    raw = np.mean([correct[t].mean() for t in TRIPLES])
+    print(f"TMR triples: raw replica yield {100 * raw:.1f}% -> voted {100 * tmr_ok.mean():.1f}% (ideal voter)")
 
-    # ---- CSV ----
-    with open("sha256_macro_dies.csv", "w", newline="") as f:
+    out_T = Tm.reshape(-1, Mt)                            # final digest-bit temperatures
+    marg = np.abs(out_T - T_TR)
+    print(f"Output-bit temperatures: pristine refs min margin {marg[:, M:].min():.1f} K | wafer min margin {marg[:, :M].min():.1f} K")
+
+    with open("phonon_logic_macro_dies.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["macro", "cx_mm", "cy_mm", "group", "message", "n_fatal_subdies", "n_soft_subdies",
-                    "expected_sha256", "computed_sha256", "correct", "hamming_bits"])
+        w.writerow(["macro", "cx_mm", "cy_mm", "class", "core_state_segments", "halo_state_segments",
+                    "correct", "hamming_bits"])
         for mi, (ti, tj) in enumerate(tiles):
-            w.writerow([mi, f"{TCX[ti, tj]:.0f}", f"{TCY[ti, tj]:.0f}", GROUP[mi], MSGS[mi], n_fatal[mi],
-                        n_soft[mi], f"{EXPECT[mi]:064x}", f"{got[mi]:064x}", int(correct[mi]), ham[mi]])
+            w.writerow([mi, f"{TCX[ti, tj]:.0f}", f"{TCY[ti, tj]:.0f}", cat[mi], fab.hit_core[mi],
+                        fab.hit_halo[mi], int(correct[mi]), ham[mi]])
 
     # ---- plots ----
-    th_ = np.linspace(0, 2 * np.pi, 300)
-    def ring(a):
-        a.plot(R * np.cos(th_), R * np.sin(th_), "k", lw=1)
-        a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([])
-
     fig, ax = plt.subplots(2, 3, figsize=(20, 12.5))
+    a = ax[0, 0]
+    for lab, d, st, c in (("pristine bulk", clean, 0, "k"), ("dislocation-dense die", dense, 0, "tab:blue"),
+                          ("strain halo (MFP 0.3 um)", clean, 1, "tab:orange"), ("hollow core (MFP 10 nm)", clean, 2, "crimson")):
+        a.plot(TGRID, KT[d, :, st], c=c, marker="o", ms=3, label=lab)
+    a.axvspan(TC, TH, color="gold", alpha=0.15, label="logic temperature range")
+    a.set_xlabel("temperature (K)"); a.set_ylabel("Callaway kappa (W/mK)"); a.set_yscale("log"); a.legend(fontsize=8)
+    a.set_title("Phonon thermal conductivity of each physical state")
 
-    a = ax[0, 0]; ring(a)
-    cls = np.where(fatal, "crimson", np.where(recheck | risk, "gold", "lightgray"))
-    a.scatter(xc, yc, c=cls, marker="s", s=34, zorder=2)
-    for mi, (ti, tj) in enumerate(tiles):
-        a.add_patch(Rectangle((TCX[ti, tj] - DIE, TCY[ti, tj] - DIE), 2 * DIE, 2 * DIE,
-                              fill=True, fc="limegreen" if correct[mi] else "black",
-                              alpha=0.30 if correct[mi] else 0.55, ec="green" if correct[mi] else "red",
-                              lw=1.1, zorder=3))
-    a.set_title(f"SHA-256 macro dies: {correct.sum()}/{M} correct\n"
-                "green = hash OK, black = wrong;  sub-dies: gray pass / gold soft / red fatal", fontsize=10)
-
-    a = ax[0, 1]; ring(a)
-    a.scatter(xc, yc, c="whitesmoke", marker="s", s=34)
-    for k, tr in enumerate(TRIPLES):
-        x0 = min(TCX[tiles[m][0], tiles[m][1]] for m in tr) - DIE
-        y0 = TCY[tiles[tr[0]][0], tiles[tr[0]][1]] - DIE
-        a.add_patch(Rectangle((x0, y0), 6 * DIE, 2 * DIE, fc="limegreen" if tmr_ok[k] else "black",
-                              alpha=0.35 if tmr_ok[k] else 0.6, ec="k", lw=0.8))
-        for m in tr:
-            if not correct[m]:
-                a.scatter(TCX[tiles[m][0], tiles[m][1]], TCY[tiles[m][0], tiles[m][1]], c="red", marker="x", s=40, zorder=4)
-    a.set_title(f"TMR triples (3 macro dies + NAND voter): {tmr_ok.sum()}/{len(TRIPLES)} voted correct\n"
-                "red x = replica with wrong hash", fontsize=10)
+    a = ax[0, 1]
+    for n, c in zip(vtc, ("k", "tab:blue", "tab:orange", "crimson")): a.plot(Tin, vtc[n], c=c, label=n)
+    a.plot(Tin, Tin, "g:", lw=0.8); a.axvline(T_TR, c="gray", ls="--", lw=0.8); a.axhline(T_TR, c="gray", ls="--", lw=0.8)
+    a.set_xlabel("input temperature (K)"); a.set_ylabel("output temperature (K)"); a.legend(fontsize=8)
+    a.set_title(f"Thermal NAND transfer curve (inputs tied)\nNM_low={VIL - VOL:.0f} K, NM_high={VOH - VIH:.0f} K, gain={abs(g.min()):.0f}")
 
     a = ax[0, 2]
-    a.hist(ham[wrong], bins=np.arange(90, 170, 2), color="steelblue", density=True, label="wrong hashes")
-    xs = np.arange(90, 170)
-    from math import comb
-    a.plot(xs, [comb(256, int(k)) / 2 ** 256 * 2 for k in xs], "r-", label="Binomial(256, 0.5)")
-    a.axvline(128, c="k", ls=":"); a.set_xlabel("bits differing from correct digest (of 256)")
-    a.set_title("Avalanche: any surviving fault scrambles the digest"); a.legend()
+    combos = [(TC, TC), (TC, TH), (TH, TC), (TH, TH)]
+    wd = 0.2
+    for k_, (n, c) in enumerate(zip(vtc, ("k", "tab:blue", "tab:orange", "crimson"))):
+        st, d = {"pristine": (0, clean), "dislocation-dense": (0, dense), "strain halo": (1, clean), "hollow core": (2, clean)}[n]
+        ys = [float(nand_T(np.array(x), np.array(y_), rf(st, d), rf(st, d))) for x, y_ in combos]
+        a.bar(np.arange(4) + (k_ - 1.5) * wd, ys, wd, color=c, label=n)
+    a.axhline(T_TR, c="gray", ls="--"); a.set_xticks(range(4)); a.set_xticklabels(["00", "01", "10", "11"])
+    a.set_ylim(290, 370); a.set_xlabel("inputs (A,B)"); a.set_ylabel("output temperature (K)"); a.legend(fontsize=8)
+    a.set_title("NAND truth table in temperature (needs 11 -> cold)")
 
+    th_ = np.linspace(0, 2 * np.pi, 300)
     a = ax[1, 0]
-    labels_ = ["all macro dies", "clean", "soft only", "has FATAL", "TMR (raw replicas)", "TMR voted"]
-    vals = [correct.mean()] + [correct[cat == c].mean() if (cat == c).any() else 0
-                               for c in ("clean", "soft faults only", "has FATAL sub-die")] \
-           + [raw_in_triples, tmr_ok.mean()]
-    bars = a.bar(labels_, np.array(vals) * 100, color=["gray", "limegreen", "gold", "crimson", "lightsteelblue", "navy"])
-    for b_, v in zip(bars, vals): a.text(b_.get_x() + b_.get_width() / 2, v * 100 + 1, f"{100 * v:.0f}%", ha="center")
-    a.set_ylim(0, 112); a.set_ylabel("correct SHA-256 (%)"); a.tick_params(axis="x", rotation=20)
-    a.set_title("Hash yield by sub-die state and redundancy")
+    a.plot(R * np.cos(th_), R * np.sin(th_), "k", lw=1); a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([])
+    xc, yc = gx + DIE / 2, gy + DIE / 2
+    a.scatter(xc, yc, c=np.where(P_CORE > 0, "crimson", np.where(P_HALO > 0, "gold", "lightgray")), marker="s", s=34, zorder=2)
+    for mi, (ti, tj) in enumerate(tiles):
+        a.add_patch(Rectangle((TCX[ti, tj] - DIE, TCY[ti, tj] - DIE), 2 * DIE, 2 * DIE, fc="limegreen" if correct[mi] else "black",
+                              alpha=0.30 if correct[mi] else 0.55, ec="green" if correct[mi] else "red", lw=1.1, zorder=3))
+    a.set_title(f"Thermal-logic SHA-256 macro dies: {correct.sum()}/{M} correct\n"
+                "sub-dies: gray bulk / gold halo / red hollow core", fontsize=10)
 
     a = ax[1, 1]
-    names = list(fab0.cats); counts = [fab0.cats[n] for n in names]
-    a.barh(names, counts, color="slategray")
-    for i, c in enumerate(counts): a.text(c, i, f" {c:,}", va="center", fontsize=9)
-    a.set_xlim(0, max(counts) * 1.25); a.invert_yaxis()
-    a.set_title(f"NAND2 gate budget per macro die ({N:,} total)")
+    bins = np.linspace(TC - 5, TH + 5, 90)
+    a.hist(out_T[:, M:].ravel(), bins=bins, alpha=0.7, color="navy", density=True, label="pristine reference macros")
+    if correct.any(): a.hist(out_T[:, :M][:, correct].ravel(), bins=bins, alpha=0.5, color="limegreen", density=True, label="wafer, correct")
+    if wrong.any(): a.hist(out_T[:, :M][:, wrong].ravel(), bins=bins, alpha=0.5, color="crimson", density=True, label="wafer, wrong")
+    a.axvline(T_TR, c="k", ls="--"); a.set_yscale("log"); a.set_xlabel("final digest-bit temperature (K)"); a.legend(fontsize=8)
+    a.set_title("Analog output levels after ~380k thermal gates")
 
     a = ax[1, 2]
-    a.hist(100 * null_glob, bins=25, alpha=0.6, color="gray", label=f"scattered defects (p={p_glob:.3f})")
-    a.hist(100 * null_ring, bins=25, alpha=0.6, color="steelblue", label=f"ring-shuffled (p={p_ring:.3f})")
-    a.axvline(100 * obs, c="r", lw=2, label=f"observed {100 * obs:.1f}%")
-    a.set_xlabel("fault-free macro dies (%)"); a.legend(fontsize=8)
-    a.set_title("Permutation test: does defect clustering raise macro-die yield?")
-
-    plt.tight_layout(); plt.savefig("sic_wafer_sha256.png", dpi=120)
-
-    ex_ok = int(np.where(correct)[0][0]); ex_bad = int(np.where(wrong)[0][0])
-    print(f"\nExample good macro #{ex_ok}: {got[ex_ok]:064x}")
-    print(f"Example bad  macro #{ex_bad}: {got[ex_bad]:064x}")
-    print(f"      correct digest   : {EXPECT[ex_bad]:064x}   ({ham[ex_bad]} bits differ)")
-    print("\nSaved sic_wafer_sha256.png, sha256_macro_dies.csv")
+    lams = np.linspace(0.03, 1.0, 120)
+    for n, c in zip(vtc, ("k", "tab:blue", "tab:orange", "crimson")):
+        st, d = {"pristine": (0, clean), "dislocation-dense": (0, dense), "strain halo": (1, clean), "hollow core": (2, clean)}[n]
+        a.plot(lams, [float(nand_T(np.array(TH), np.array(TH), rf(st, d), rf(st, d), lam=l_)) for l_ in lams], c=c, label=n)
+    a.axhline(T_TR, c="gray", ls="--"); a.axvline(LAMBDA, c="g", ls=":", label=f"chosen load ratio {LAMBDA}")
+    a.set_xlabel("load / segment conductance ratio"); a.set_ylabel("NAND(1,1) low level (K)"); a.legend(fontsize=8)
+    a.set_title("Design window: gate fails once low level crosses the switch threshold")
+    plt.tight_layout(); plt.savefig("sic_wafer_phonon_logic.png", dpi=120)
+    print("\nSaved sic_wafer_phonon_logic.png, phonon_logic_macro_dies.csv")
