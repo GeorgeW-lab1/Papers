@@ -22,7 +22,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
-from matplotlib.patches import Rectangle, Circle
+from matplotlib.patches import Rectangle, Circle, Patch
+from matplotlib.lines import Line2D
 from matplotlib.colors import ListedColormap, Normalize
 
 from sic_phonon_sha256_all_in_one import (phonon_sha256_batch, K, H0, ALPHA_TSD, ALPHA_BPD,
@@ -154,9 +155,9 @@ F1, F2, F3, F4 = P1, P1 + P2, P1 + P2 + P3, P1 + P2 + P3 + P4
 NFRAMES = F4 + P5
 
 fig = plt.figure(figsize=(12.5, 7.2))
-axw = fig.add_axes([0.02, 0.07, 0.42, 0.80])
-axr = fig.add_axes([0.47, 0.50, 0.51, 0.37])
-axt = fig.add_axes([0.47, 0.06, 0.51, 0.38]); axt.axis('off')
+axw = fig.add_axes([0.02, 0.19, 0.42, 0.70])
+axr = fig.add_axes([0.47, 0.56, 0.51, 0.33])
+axt = fig.add_axes([0.47, 0.19, 0.51, 0.34]); axt.axis('off')
 title = fig.text(0.5, 0.955, "", ha='center', fontsize=14, fontweight='bold')
 fig.text(0.02, 0.012, "Conceptual simulation: IR->bit mapping and attenuation values are assumptions; "
          "SHA-256 is computed on the software phonon-NAND model.", fontsize=7.5, color='#555')
@@ -184,6 +185,24 @@ axr.grid(which='minor', color='#aab7b8', lw=.4); axr.tick_params(which='both', l
 axr.set_xticks([0, 31]); axr.set_xticklabels(["b31", "b0"], fontsize=7)
 axr.set_yticks([0, 15]); axr.set_yticklabels(["W0", "W15"], fontsize=7)
 axr.set_title("SHA-256 512-bit input block  (cyan = 1, white = 0, purple = padding)", fontsize=9)
+
+
+legend_handles = [
+    Patch(fc=cmapT(normT(0.95)), ec='#566573', label='Site, high IR transmission (PASS, T \u2265 80%)'),
+    Patch(fc=cmapT(normT(0.5)), ec='#566573', hatch='xxx', label='Site, IR blocked (FAIL, T < 80%)'),
+    Patch(fc='#f2f3f4', ec='#99a3a4', label='Site not yet scanned'),
+    Line2D([], [], marker='x', ls='', c='#c0392b', label='TSD defect'),
+    Line2D([], [], marker='s', ls='', c='#e67e22', label='BPD defect'),
+    Patch(fc='none', ec='#e74c3c', lw=2.5, label='Current site / probe'),
+    Patch(fc='none', ec='#8e44ad', lw=2.5, label='Neighbour site (interacting)'),
+    Line2D([], [], marker='o', ls='-', c='#8e44ad', mfc='#e74c3c', label='Probe pair: phonon link'),
+    Patch(fc='#ecf0f1', ec='#aab7b8', label='Input bit: empty'),
+    Patch(fc='#ffffff', ec='#aab7b8', label='Input bit = 0'),
+    Patch(fc='#00bcd4', ec='#aab7b8', label='Input bit = 1'),
+    Patch(fc='#8e44ad', ec='#aab7b8', label='Padding bit = 1 (light = 0)'),
+]
+fig.legend(handles=legend_handles, loc='lower center', ncol=4, fontsize=7.5, title='Legend',
+           title_fontsize=8, bbox_to_anchor=(0.5, 0.03), frameon=True)
 
 
 def frame_state(f):
