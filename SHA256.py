@@ -1,639 +1,1641 @@
+#!/usr/bin/env python3
+"""IR-bench SHA-256 proof-of-work.
+
+Bitcoin-style double SHA-256:
+    digest = SHA256(SHA256(header_76_bytes || nonce_4_bytes))
+
+Difficulty 20 means the final 32-byte digest must contain at least
+20 leading zero bits.
+
+Timing model:
+    Every optical exposure is assumed to take 1 ms.
+    Reported bench hash rate = validated hashes / (exposures * 0.001 s).
+
+The optical bench performs lane-parallel nonce arithmetic and simulated
+camera exposures. The CPU computes and validates every SHA-256 hash.
+The optical system does not compute SHA-256.
+
+Run:
+    python -m pip install pillow
+    python sha256_pow_ir_bench.py
 """
-ir_phonon_sha256_all.py -- everything in one file (replaces si_acoustic_defect_sha256_v2.py, ir_phonon_speed_limit.py,
-ir_phonon_full_sha256.py).
 
-PIPELINE
-  1. ACOUSTIC BLAST   real 2-D wave FDTD of the patterned wafer (pads, trenches, TSD/BPD scatterers) -> 440 bits/message, 16 messages.
-                      Messages are generated automatically and cached in msgs.pkl (no manual --prep needed).
-  2. PHONON LATTICE   every pad is a REAL diatomic Si-C lattice: a ring of NCELL=6 unit cells (12 atoms), masses 28.09/12.01 amu,
-                      nearest-neighbour bond springs, quartic bond anharmonicity, uniform viscous damping (Q), IR drive through
-                      opposite Born charges on Si and C.  A defect = a softened, more anharmonic bond at a random position in the pad.
-                      The pad "output" is the total dipole  d = mean(u_Si - u_C)  (what an IR detector sees); lock-in at f0 = 23.9 THz.
-                      State (u, v of all 12 atoms) PERSISTS between firings; pads idle between firings really decay (exact linear
-                      propagator), nothing is reset by hand.
-  3. SHA-256          the full compression as a threshold-logic netlist (60,928 firings, depth 2376) executed level by level on the pads.
-  4. CHECKS           digests vs hashlib, raw gate errors, leftover ringing, simulated hash time.  --validate checks the lattice itself.
+import csv
+import hashlib
+import math
+import random
+import struct
+import time
+import traceback
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox
 
-USAGE
-  python ir_phonon_sha256_all.py                  # = --validate  then  --scen fast
-  python ir_phonon_sha256_all.py --validate       # lattice physics checks (dispersion, sum rule, energy/momentum, regression)
-  python ir_phonon_sha256_all.py --prep           # (re)generate the acoustic messages  (also happens automatically when missing)
-  python ir_phonon_sha256_all.py --study          # speed-limit study: plain wait vs RZ reset, error rate vs Q / defects
-  python ir_phonon_sha256_all.py --scen fast|q20|natural [--skip-micro] [--no-anim]
-  python ir_phonon_sha256_all.py --all            # validate + study + fast + q20
-Scenarios: fast = engineered Q=5 + per-pad calibrated anti-phase reset, 2-period cycle (84 fs)
-           q20  = Q=20, plain wait, 32-period cycle      natural = SiC Q=150, plain wait, 256-period cycle  (slow)
-"""
-import os, sys, time, pickle, hashlib
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageTk
 
-# =====================================================================================================================
-# 1. WAFER + ACOUSTIC FDTD
-# =====================================================================================================================
-WAFER_R, SITE, DX = 50.0, 8.0, 0.5            # mm
-PROBES = [(0, 0), (-2, -2), (2, -2), (-2, 2), (2, 2)]
-NG = int(2 * WAFER_R / DX)                     # 200 x 200 cells
-MSG_FILE = "msgs.pkl"
+DEFAULT_CELLS = 64
+MAX_CELLS = 1024
+DEFAULT_DIFFICULTY = 10
+MAX_DIFFICULTY = 32
+MAX_HASHES = 20_000_000
 
-def make_wafer(seed=123):
-    R = WAFER_R; rng = np.random.default_rng(seed)
-    r = R * np.sqrt(rng.random(120)); th = 2 * np.pi * rng.random(120)
-    tsd = np.column_stack((r * np.cos(th), r * np.sin(th)))
-    s = rng.uniform(-R * .8, R * .8, 45)
-    x = s * np.cos(np.pi / 4) + rng.normal(0, 2, 45); y = s * np.sin(np.pi / 4) + rng.normal(0, 8, 45)
-    bpd = np.column_stack((x, y))[x**2 + y**2 <= R**2]
-    sites = []; n = int(R // SITE) + 1
-    for i in range(-n, n):
-        for j in range(-n, n):
-            x0, y0 = i * SITE, j * SITE
-            if all(cx**2 + cy**2 <= (R - 2)**2 for cx, cy in
-                   [(x0, y0), (x0 + SITE, y0), (x0, y0 + SITE), (x0 + SITE, y0 + SITE)]):
-                sites.append((x0 + SITE / 2, y0 + SITE / 2, x0, y0))
-    sites.sort(key=lambda q: (-q[3], q[2]))
-    sites = np.array(sites)
-    alld = np.vstack((tsd, bpd))
-    ndef = np.array([int(((alld[:, 0] >= s_[2]) & (alld[:, 0] < s_[2] + SITE) &
-                          (alld[:, 1] >= s_[3]) & (alld[:, 1] < s_[3] + SITE)).sum()) for s_ in sites])
-    return sites, tsd, bpd, ndef
+EXPOSURE_TIME_MS = 0.0002
+EXPOSURE_TIME_S = EXPOSURE_TIME_MS / 1000.0
 
-def acoustic_blast(sites, tsd, bpd, nsteps=1400, nsnap=40, snap_stride=14, P=16):
-    xs = (np.arange(NG) + .5) * DX - WAFER_R
-    X, Y = np.meshgrid(xs, xs, indexing="xy"); Rr = np.hypot(X, Y)
-    c2 = np.full((NG, NG), 0.25)                              # (c dt/dx)^2, CFL-stable
-    edge = ((X + WAFER_R) % SITE < DX) | ((Y + WAFER_R) % SITE < DX)
-    c2[edge] *= 0.55                                          # patterned trenches between pads
-    for p in np.vstack((tsd, bpd)):                           # defect scatterers (2x2 cells, soft)
-        i = int((p[0] + WAFER_R) / DX); j = int((p[1] + WAFER_R) / DX)
-        c2[max(j, 0):j + 2, max(i, 0):i + 2] *= 0.2
-    g = np.where(Rr <= WAFER_R, 0.0015, 0.25)                 # material damping / absorbing surround
-    ring = (Rr > WAFER_R - 4.5) & (Rr <= WAFER_R - 3.0)
-    u = np.zeros((NG, NG)); up = np.zeros_like(u)
-    pidx = lambda x, y: (int((y + WAFER_R) / DX), int((x + WAFER_R) / DX))
-    probe_cells = [pidx(s_[0] + dx, s_[1] + dy) for s_ in sites for dx, dy in PROBES]
-    pj = np.array([c[0] for c in probe_cells]); pi_ = np.array([c[1] for c in probe_cells])
-    cj = np.array([pidx(s_[0], s_[1])[0] for s_ in sites]); ci = np.array([pidx(s_[0], s_[1])[1] for s_ in sites])
-    rec = np.zeros((nsteps, len(pj)), np.float32); recpad = np.zeros((nsteps, len(sites)), np.float32); snaps = []
-    ncyc = 3
-    for n in range(nsteps):
-        lap = np.roll(u, 1, 0) + np.roll(u, -1, 0) + np.roll(u, 1, 1) + np.roll(u, -1, 1) - 4 * u
-        src = 0.0
-        if n < ncyc * P:
-            src = np.sin(2 * np.pi * n / P) * np.sin(np.pi * n / (ncyc * P))**2
-        un = (2 * u - (1 - g / 2) * up + c2 * lap + 0.8 * src * ring) / (1 + g / 2)
-        up, u = u, un
-        rec[n] = u[pj, pi_]; recpad[n] = u[cj, ci]
-        if n % snap_stride == 0 and len(snaps) < nsnap: snaps.append(u.astype(np.float32).copy())
-    E = (rec.astype(np.float64)**2).sum(0)
-    return E, np.array(snaps), recpad
+DPI = 2540
+SIZE_MM = 20
+PX_PER_MM = 100
+DIAMETER_MM = 0.7
+SHOT_K = 0.06
 
-def bits_to_message(bits):
-    bits = bits[: len(bits) // 8 * 8]
-    return bytes(int("".join(map(str, bits[k:k + 8])), 2) for k in range(0, len(bits), 8))
 
-def load_or_make_messages(sites, tsd, bpd, path=MSG_FILE, force=False):
-    """Return the 16 acoustic messages (bits, bytes, hashlib refs, wave snapshots).  Generated + cached if the file is missing,
-    unreadable, or was made for a different wafer (so a stale/foreign msgs.pkl can never be used silently)."""
-    meta = dict(NG=int(NG), nsites=int(len(sites)), ndef=[int(x) for x in make_wafer()[3]], ver=3)
-    if os.path.exists(path) and not force:
-        try:
-            with open(path, "rb") as fh: D = pickle.load(fh)
-            if D.get("meta") == meta: return D
-            print(f"{path}: made for a different wafer/version -> regenerating", flush=True)
-        except Exception as e:
-            print(f"{path}: unreadable ({e}) -> regenerating", flush=True)
-    else:
-        print(f"{path} not found -> running the acoustic blasts (16 x FDTD) ...", flush=True)
-    t0 = time.time()
-    E0, snaps, recpad = acoustic_blast(sites, tsd, bpd, P=16); bl = [(E0 >= np.median(E0)).astype(int)]
-    for P_ in [10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25]:
-        Ep, _, _ = acoustic_blast(sites, tsd, bpd, nsteps=1200, nsnap=0, P=P_); bl.append((Ep >= np.median(Ep)).astype(int))
-    assert len(E0) == 440, f"expected 440 probe energies (88 pads x 5), got {len(E0)}"
-    msgs = [bits_to_message(b) for b in bl]; refs = [hashlib.sha256(m).hexdigest() for m in msgs]
-    D = dict(meta=meta, E0=E0, snaps=snaps, recpad=recpad, bits=bl, msgs=msgs, refs=refs)
-    with open(path, "wb") as fh: pickle.dump(D, fh)
-    print(f"acoustic messages ready in {time.time()-t0:.0f}s -> {path};  message 0: {msgs[0].hex()}", flush=True)
-    return D
+# ---------------------------------------------------------------------------
+# Printable 20 mm mask
+# ---------------------------------------------------------------------------
 
-# =====================================================================================================================
-# 2. SHA-256 THRESHOLD-LOGIC NETLIST
-# =====================================================================================================================
-MASK = 0xFFFFFFFF
-K = [int(x, 16) for x in """428a2f98 71374491 b5c0fbcf e9b5dba5 3956c25b 59f111f1 923f82a4 ab1c5ed5 d807aa98 12835b01 243185be 550c7dc3
-72be5d74 80deb1fe 9bdc06a7 c19bf174 e49b69c1 efbe4786 0fc19dc6 240ca1cc 2de92c6f 4a7484aa 5cb0a9dc 76f988da
-983e5152 a831c66d b00327c8 bf597fc7 c6e00bf3 d5a79147 06ca6351 14292967 27b70a85 2e1b2138 4d2c6dfc 53380d13
-650a7354 766a0abb 81c2c92e 92722c85 a2bfe8a1 a81a664b c24b8b70 c76c51a3 d192e819 d6990624 f40e3585 106aa070
-19a4c116 1e376c08 2748774c 34b0bcb5 391c0cb3 4ed8aa4a 5b9cca4f 682e6ff3 748f82ee 78a5636f 84c87814 8cc70208
-90befffa a4506ceb bef9a3f7 c67178f2""".split()]
-H0 = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+def grid_shape(cells):
+    cols = min(cells, math.ceil(math.sqrt(2 * cells)))
+    return cols, math.ceil(cells / cols)
 
-class Net:
-    """Wires 0/1 are constants.  A gate = one pad firing: out = [sum_i w_i b_i >= theta] (weights 0..2, <=4 inputs).
-    Complementary outputs come free from the differential detector (neg())."""
-    def __init__(s): s.lvl = [0, 0]; s.gi = []; s.gw = []; s.gth = []; s.gout = []; s.alias = []; s.negmap = {0: 1, 1: 0}
-    def inp(s): s.lvl.append(0); return len(s.lvl) - 1
-    def neg(s, w):
-        if w in s.negmap: return s.negmap[w]
-        nw = len(s.lvl); s.lvl.append(s.lvl[w]); s.alias.append((nw, w)); s.negmap[nw] = w; s.negmap[w] = nw; return nw
-    def th(s, ins, theta):
-        ins = list(ins) + [(0, 0)] * (4 - len(ins)); w = len(s.lvl)
-        s.lvl.append(1 + max(s.lvl[i] for i, _ in ins)); s.gi.append([i for i, _ in ins]); s.gw.append([k for _, k in ins])
-        s.gth.append(theta); s.gout.append(w); return w
-    def and2(s, a, b): return s.th([(a, 1), (b, 1)], 2)
-    def or2(s, a, b): return s.th([(a, 1), (b, 1)], 1)
-    def maj(s, a, b, c): return s.th([(a, 1), (b, 1), (c, 1)], 2)
-    def fa(s, a, b, c):
-        co = s.maj(a, b, c); sm = s.th([(a, 1), (b, 1), (c, 1), (s.neg(co), 2)], 3); return sm, co
-    def xor3w(s, A, B, C): return [s.fa(A[i], B[i], C[i])[0] for i in range(32)]
-    def chw(s, E, F_, G): return [s.or2(s.and2(E[i], F_[i]), s.and2(s.neg(E[i]), G[i])) for i in range(32)]
-    def majw(s, A, B, C): return [s.maj(A[i], B[i], C[i]) for i in range(32)]
-    def csa(s, A, B, C):
-        out = [s.fa(A[i], B[i], C[i]) for i in range(32)]; return [o[0] for o in out], [0] + [o[1] for o in out][:31]
-    def add(s, A, B):
-        c = 0; o = []
-        for i in range(32):
-            sm, c = s.fa(A[i], B[i], c); o.append(sm)
-        return o
 
-def rotr(w, n): return [w[(i + n) % 32] for i in range(32)]
-def shr(w, n): return [w[i + n] if i + n < 32 else 0 for i in range(32)]
-def cword(v): return [(v >> i) & 1 for i in range(32)]
+def mm(value):
+    return round(value * PX_PER_MM)
 
-def build_sha_net(nbits=440):
-    net = Net(); inw = [net.inp() for _ in range(nbits)]
-    blk = inw + [1] + [0] * (512 - 64 - nbits - 1) + [(nbits >> (63 - k)) & 1 for k in range(64)]
-    W = [[blk[32 * t + 31 - i] for i in range(32)] for t in range(16)]
-    a, b, c, d, e, f, g, h = [cword(v) for v in H0]; rend, stw = [], []
-    for t in range(64):
-        if t >= 16:
-            w15, w2 = W[t - 15], W[t - 2]
-            s0 = net.xor3w(rotr(w15, 7), rotr(w15, 18), shr(w15, 3)); s1 = net.xor3w(rotr(w2, 17), rotr(w2, 19), shr(w2, 10))
-            p, q = net.csa(s0, W[t - 16], W[t - 7]); p, q = net.csa(p, q, s1); W.append(net.add(p, q))
-        S1 = net.xor3w(rotr(e, 6), rotr(e, 11), rotr(e, 25)); chv = net.chw(e, f, g)
-        p, q = net.csa(h, S1, chv); p, q = net.csa(p, q, cword(K[t])); p, q = net.csa(p, q, W[t]); t1 = net.add(p, q)
-        S0 = net.xor3w(rotr(a, 2), rotr(a, 13), rotr(a, 22)); t2 = net.add(S0, net.majw(a, b, c))
-        en = net.add(d, t1); an = net.add(t1, t2)
-        h, g, f, e, d, c, b, a = g, f, e, en, c, b, a, an
-        rend.append(len(net.gout) - 1); stw.append([a, b, c, d, e, f, g, h])
-    dig = [net.add(cword(H0[i]), w) for i, w in enumerate([a, b, c, d, e, f, g, h])]
-    return net, inw, rend, stw, dig
 
-def word_val(val, w): return sum(int(val[wi]) << i for i, wi in enumerate(w))
+def make_mask(cells):
+    if not 1 <= cells <= MAX_CELLS:
+        raise ValueError(f'Cells must be 1..{MAX_CELLS}.')
 
-# =====================================================================================================================
-# 3. THE PHONON LATTICE (one pad = one Si-C ring lattice)
-# =====================================================================================================================
-M_SI, M_C = 28.0855, 12.011                    # amu
-NCELL = 6; NA = 2 * NCELL; NB = NA             # 6 unit cells = 12 atoms in a ring (Born-von Karman cell) = 12 bonds
-MASS = np.tile([M_SI, M_C], NCELL)             # atom j even = Si, odd = C ; bond j joins atom j and atom j+1 (periodic)
-SGN = np.tile([1.0, -1.0], NCELL)              # sign of the Born charge (Si +, C -): neutral cell, so the field only drives the dipole
-MU = M_SI * M_C / (M_SI + M_C)
-K0 = 1.0 / (2.0 * (1.0 / M_SI + 1.0 / M_C))    # bond stiffness chosen so the zone-centre TO mode sits at omega = 1  (= 23.9 THz)
-GDRV = SGN * MU / MASS                         # acceleration of atom j per unit effective drive (-> dipole drive = FD*s exactly)
-IM = 1.0 / MASS
-BETA0 = 0.05                                   # quartic bond anharmonicity  beta_b = BETA0*K0  (-> Duffing beta=0.05 on the dipole mode)
-SOFT = 0.30                                    # a defective bond keeps 30% of its stiffness (core of a TSD/BPD)  [ASSUMPTION]
-ANH_DEF = 2.0                                  # and is 2x more anharmonic                                         [ASSUMPTION]
-SPP = 24; DT = 2 * np.pi / SPP; FD = 0.03      # RK4 steps per drive period, drive strength per unit input sum
-F0_HZ = 23.9e12                                # 4H-SiC TO phonon (796 cm^-1)
-HF = 6.626e-34 * F0_HZ
-TNL_FRAC = 0.35                                # after a firing, integrate the weakly nonlinear ring-down for 0.35*Q periods, then
-                                               # the (decayed) remainder with the exact linear propagator
-SCEN = {"fast": dict(Q=5.0, cyc=(1, 1, 0), reset=True), "q20": dict(Q=20.0, cyc=(1, 0, 31), reset=False),
-        "natural": dict(Q=150.0, cyc=(1, 0, 255), reset=False)}
+    cols, rows = grid_shape(cells)
+    pitch_x = 16 / cols
+    pitch_y = 16 / rows
+    diameter = min(DIAMETER_MM, pitch_x / 4.5, pitch_y / 4)
+    dx = pitch_x * 0.25
+    dy = pitch_y * 0.16
 
-def draw_mask(n, rng):
-    """bitmask of n distinct defective bonds out of NB at random positions"""
-    if n <= 0: return 0
-    return int(sum(1 << int(b) for b in rng.choice(NB, min(int(n), NB), replace=False)))
+    image = Image.new('1', (mm(SIZE_MM), mm(SIZE_MM)), 0)
+    draw = ImageDraw.Draw(image)
+    layout = []
+    radius = mm(diameter) / 2
 
-def dip(u): return u[:, 0::2].mean(1) - u[:, 1::2].mean(1)        # dipole  d = <u_Si - u_C>
+    for i in range(cells):
+        cx = 2 + (i % cols + 0.5) * pitch_x
+        cy = 2 + (i // cols + 0.5) * pitch_y
 
-class Pads:
-    """Table of distinct pad lattices (one per defect configuration) at a given Q, plus their per-class reset pulse (ra, rb)."""
-    def __init__(self, masks, Q):
-        self.masks = np.asarray(masks, np.int64); self.C = len(self.masks); self.Q = float(Q); self.gam = 1.0 / Q
-        bits = ((self.masks[:, None] >> np.arange(NB)) & 1).astype(float)
-        self.kb = K0 * (1 - (1 - SOFT) * bits); self.bb = BETA0 * K0 * (1 + (ANH_DEF - 1) * bits)
-        self.ra = np.zeros(self.C); self.rb = np.zeros(self.C); self._pw = None
-        self.tnl = int(np.ceil(TNL_FRAC * Q)); self.tcap = int(np.ceil(12 * Q))     # amplitude e^{-pi*12} < 1e-16 beyond tcap
-    def stiffness(self):
-        Km = np.zeros((self.C, NA, NA))
-        for j in range(NB):
-            a, b, k = j, (j + 1) % NA, self.kb[:, j]
-            Km[:, a, a] += k; Km[:, b, b] += k; Km[:, a, b] -= k; Km[:, b, a] -= k
-        return Km
-    def powers(self):
-        """Phi(2^j periods) for the LINEAR (harmonic + damping) lattice, j = 0..: exact free evolution of (u, v)."""
-        if self._pw is None:
-            A = np.zeros((self.C, 2 * NA, 2 * NA)); I = np.eye(NA)
-            A[:, :NA, NA:] = I; A[:, NA:, :NA] = -self.stiffness() * IM[None, :, None]; A[:, NA:, NA:] = -self.gam * I
-            Ah = A * DT; E = np.tile(np.eye(2 * NA), (self.C, 1, 1)); term = E.copy()
-            for n in range(1, 30): term = term @ Ah / n; E = E + term          # exp(A*DT) to machine precision
-            pw = [np.linalg.matrix_power(E, SPP)]
-            for _ in range(int(self.tcap).bit_length() - 1): pw.append(pw[-1] @ pw[-1])
-            self._pw = pw
-        return self._pw
+        for label, ox, oy in [
+            ('a', -dx, -dy),
+            ('b', 0, -dy),
+            ('carry', dx, -dy),
+            ('ref_A', -dx / 2, dy),
+            ('ref_B', dx / 2, dy),
+        ]:
+            x = mm(cx + ox)
+            y = mm(cy + oy)
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=1
+            )
+            layout.append((i + 1, label, cx + ox, cy + oy, diameter))
 
-def idle(P, cls, X, V, T):
-    """Free evolution for T periods (T: int or per-lane int array).  State beyond tcap periods has decayed < 1e-16 -> set to 0."""
-    T = np.broadcast_to(np.asarray(T, np.int64), (len(cls),)).copy()
-    if not T.any(): return X, V
-    y = np.concatenate([X, V], 1); dead = T >= P.tcap; y[dead] = 0.0; T[dead] = 0
-    for j, Mj in enumerate(P.powers()):
-        m = ((T >> j) & 1).astype(bool)
-        if m.any(): y[m] = np.matmul(Mj[cls[m]], y[m][:, :, None])[:, :, 0]
-    return y[:, :NA].copy(), y[:, NA:].copy()
+    for x, y in [(1, 1), (19, 1), (1, 19), (19, 19)]:
+        x = mm(x)
+        y = mm(y)
+        draw.line(
+            (x - mm(0.3), y, x + mm(0.3), y),
+            fill=1,
+            width=mm(0.06)
+        )
+        draw.line(
+            (x, y - mm(0.3), x, y + mm(0.3)),
+            fill=1,
+            width=mm(0.06)
+        )
 
-def fire(P, cls, X, V, s, cyc, trace=False, elapsed=None):
-    """One firing of lanes (distinct pads) starting from their stored lattice state (X, V : (n, 12)).
-    cyc = (W, R, gap): drive the IR field with weighted input sum s for W periods (lock-in of the dipole in the LAST drive period),
-    then R periods of calibrated anti-phase reset drive, then `gap` idle periods.  `elapsed`: idle periods since the pad last fired.
-    Equation of motion for atom j (bond j joins atoms j, j+1):
-        m_j u_j'' = f_j - f_{j-1} - (m_j/Q) u_j' + q_j E(t),   f_j = k_j r_j + b_j r_j^3,  r_j = u_{j+1} - u_j."""
-    W, R, gap = cyc; n = len(cls)
-    if elapsed is not None: X, V = idle(P, cls, X, V, elapsed)
-    kb, bb = P.kb[cls], P.bb[cls]; ra, rb = P.ra[cls][:, None], P.rb[cls][:, None]; F0 = (FD * np.asarray(s, float))[:, None]
-    gam = P.gam; gm = GDRV[None, :]; im = IM[None, :]
-    def acc(t, xx, vv, ms, mc):
-        r = np.roll(xx, -1, 1) - xx; f = kb * r + bb * r**3
-        return (f - np.roll(f, 1, 1)) * im + gm * F0 * (ms * np.sin(t) + mc * np.cos(t)) - gam * vv
-    def rk(x, v, t, ms, mc, h=DT):
-        k1x = v;               k1v = acc(t, x, k1x, ms, mc)
-        k2x = v + .5*h*k1v;    k2v = acc(t + .5*h, x + .5*h*k1x, k2x, ms, mc)
-        k3x = v + .5*h*k2v;    k3v = acc(t + .5*h, x + .5*h*k2x, k3x, ms, mc)
-        k4x = v + h*k3v;       k4v = acc(t + h, x + h*k3x, k4x, ms, mc)
-        return x + h/6*(k1x + 2*k2x + 2*k3x + k4x), v + h/6*(k1v + 2*k2v + 2*k3v + k4v)
-    x = X.copy(); v = V.copy(); I = np.zeros(n); Qd = np.zeros(n); tr = []
-    for st in range((W + R) * SPP):
-        ms, mc = (1.0, 0.0) if st < W * SPP else (-ra, -rb); t = st * DT
-        x, v = rk(x, v, t, ms, mc)
-        if (W - 1) * SPP <= st < W * SPP:
-            tt = (st + 1) * DT; d = dip(x); I += d * np.cos(tt); Qd += d * np.sin(tt)
-        if trace: tr.append(dip(x))
-    amp = (2.0 / SPP) * np.hypot(I, Qd)
-    t0 = (W + R) * SPP * DT; gnl = min(gap, P.tnl)
-    for st in range(gnl * SPP): x, v = rk(x, v, t0 + st * DT, 0.0, 0.0)           # nonlinear ring-down (undriven)
-    if gap > gnl: x, v = idle(P, cls, x, v, gap - gnl)                             # decayed remainder: exact linear propagator
-    return (amp, x, v, np.array(tr)) if trace else (amp, x, v)
+    draw.rectangle((mm(1.6), mm(0.9), mm(1.8), mm(1.1)), fill=1)
 
-def thresholds(Q):
-    """Detector thresholds: midway between lock-in amplitudes of drive sums theta-1, theta on a perfect lattice from rest."""
-    P0 = Pads([0], Q); z = np.zeros((6, NA)); a = fire(P0, np.zeros(6, int), z, z, np.arange(6.0), (1, 0, 0))[0]
-    return np.array([0.0] + [0.5 * (a[t - 1] + a[t]) for t in (1, 2, 3)]), a
+    meta = {
+        'cells': cells,
+        'cols': cols,
+        'rows': rows,
+        'diameter': diameter,
+        'pitch_x': pitch_x,
+        'pitch_y': pitch_y,
+    }
+    return image, layout, meta
 
-def calibrate_reset(P, W=1, R=1):
-    """Per-pad cancellation pulse (a, b).  The reset drive is  -F0*(a sin t + b cos t)  during R periods.  The response is (nearly) linear
-    in (a, b): three trial firings + a 2x2 solve null the DIPOLE-mode amplitude and phase.  Other (localised) lattice modes of a defective
-    pad cannot be cancelled by a uniform pulse - their leftover is simulated, not assumed away."""
-    C = P.C; z = np.zeros((C, NA)); cls = np.arange(C); one = np.ones(C); zero = np.zeros(C)
-    def end(a, b):
-        P.ra[:], P.rb[:] = a, b; _, x, v = fire(P, cls, z, z, one, (W, R, 0))
-        return dip(x), v[:, 0::2].mean(1) - v[:, 1::2].mean(1)
-    x0, v0 = end(zero, zero); xa, va = end(one, zero); xb, vb = end(zero, one)
-    A = np.stack([np.stack([xa - x0, xb - x0], 1), np.stack([va - v0, vb - v0], 1)], 1)
-    sol = np.linalg.solve(A, -np.stack([x0, v0], 1)[..., None])[..., 0]; P.ra[:], P.rb[:] = sol[:, 0], sol[:, 1]
 
-def stress(P, Th, cyc, G=32, K=40, seed=2):
-    """Self-test WITH history: random drive sequences back-to-back on G pads of every defect configuration; zero errors required."""
-    rng = np.random.default_rng(seed); cls = np.repeat(np.arange(P.C), G); n = len(cls)
-    X = np.zeros((n, NA)); V = np.zeros((n, NA)); bad = np.zeros(n)
-    for k in range(K):
-        s = rng.integers(0, 6, n).astype(float); amp, X, V = fire(P, cls, X, V, s, cyc)
-        for th in (1, 2, 3): bad += ((amp >= Th[th]) != (s >= th))
-    return bad.reshape(P.C, G).sum(1) == 0
+def export_mask(folder, cells):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
 
-# =====================================================================================================================
-# 4. LATTICE VALIDATION
-# =====================================================================================================================
-def validate():
-    print("=== PHONON LATTICE VALIDATION ===")
-    P = Pads([0, 1, (1 << 0) | (1 << 5), (1 << 0) | (1 << 3) | (1 << 7)], Q=20.0)
-    Km = P.stiffness(); D = Km / np.sqrt(MASS[:, None] * MASS[None, :])[None]; w2, vec = np.linalg.eigh(D)
-    fth = lambda w2_: np.sqrt(np.maximum(w2_, 0)) * F0_HZ / 1e12
-    # (1) dispersion of the perfect lattice vs the analytic diatomic-chain result
-    q = 2 * np.pi * np.arange(NCELL) / NCELL; h = 1 / M_SI + 1 / M_C
-    root = np.sqrt(h**2 - 4 * np.sin(q / 2)**2 / (M_SI * M_C)); an = np.sort(np.concatenate([K0 * (h + root), K0 * (h - root)]))
-    err = np.abs(np.sort(w2[0]) - an).max(); wt = np.sort(fth(w2[0]))
-    print(f"(1) perfect lattice: TO(Gamma) = {wt[-1]:.3f} THz (target {F0_HZ/1e12:.1f}), acoustic top {wt[wt < 18].max():.2f} THz, "
-          f"optical bottom {wt[wt > 18].min():.2f} THz;  |omega^2 - analytic dispersion|max = {err:.1e}")
-    # (2) oscillator-strength sum rule: dipole spectral weights of all 12 modes sum to exactly 1
-    print("(2) dipole oscillator strength (sum rule: total must be 1), strongest mode:")
-    for c in range(P.C):
-        c_k = (SGN[None, :] / np.sqrt(MASS)[None, :] * vec[c].T).sum(1); wk = MU * c_k**2 / NCELL; i = wk.argmax()
-        print(f"      {bin(int(P.masks[c])).count('1')} defective bond(s): sum = {wk.sum():.12f}   main line {fth(w2[c])[i]:6.2f} THz "
-              f"weight {wk[i]:.3f}   ({(wk > 0.01).sum()} modes with >1% weight)")
-    # (3) regression: perfect lattice == scalar Duffing oscillator x'' + x/Q + x + beta x^3 = FD*s*sin t   (uniform optical mode is exact)
-    Q = 5.0; Pn = Pads([0], Q); z = np.zeros((1, NA)); s0 = 3.0
-    tr = fire(Pn, np.zeros(1, int), z, z, np.array([s0]), (1, 1, 0), trace=True)[3][:, 0]
-    x = v = 0.0; ref = []
-    acc = lambda t, x_, v_: FD * s0 * (np.sin(t) if t < 2 * np.pi - 1e-9 else 0.0) - v_ / Q - x_ - BETA0 * x_**3
-    for st in range(2 * SPP):
-        t = st * DT; ms = 1.0 if st < SPP else 0.0
-        f = lambda t_, x_, v_: FD * s0 * ms * np.sin(t_) - v_ / Q - x_ - BETA0 * x_**3
-        k1x = v; k1v = f(t, x, v); k2x = v + .5*DT*k1v; k2v = f(t + .5*DT, x + .5*DT*k1x, k2x)
-        k3x = v + .5*DT*k2v; k3v = f(t + .5*DT, x + .5*DT*k2x, k3x); k4x = v + DT*k3v; k4v = f(t + DT, x + DT*k3x, k4x)
-        x += DT/6*(k1x + 2*k2x + 2*k3x + k4x); v += DT/6*(k1v + 2*k2v + 2*k3v + k4v); ref.append(x)
-    print(f"(3) perfect lattice vs scalar Duffing oscillator (Q=5, s=3): max |d_lattice - x_scalar| = {np.abs(tr - np.array(ref)).max():.1e}"
-          f"   (peak {np.abs(ref).max():.3f})")
-    # (4) energy conservation (undriven, undamped, anharmonic, defective lattice) and (5) momentum conservation (driven, neutral cell)
-    Pd = Pads([(1 << 0) | (1 << 3) | (1 << 7)], 20.0); Pd.gam = 0.0; cl = np.zeros(1, int); rng = np.random.default_rng(0)
-    X0 = 0.05 * rng.standard_normal((1, NA)); V0 = 0.05 * rng.standard_normal((1, NA))
-    En = lambda X_, V_: (0.5 * MASS * V_**2).sum() + (0.5 * Pd.kb[0] * (np.roll(X_, -1, 1) - X_)**2 + 0.25 * Pd.bb[0] * (np.roll(X_, -1, 1) - X_)**4).sum()
-    _, X1, V1 = fire(Pd, cl, X0, V0, np.array([0.0]), (10, 0, 0))
-    print(f"(4) energy drift, 10 periods undriven/undamped/anharmonic, 3-defect lattice: {abs(En(X1, V1) - En(X0, V0)) / En(X0, V0):.1e} (relative)")
-    z1 = np.zeros((1, NA)); _, X2, V2 = fire(Pd, cl, z1, z1, np.array([5.0]), (3, 0, 0))
-    print(f"(5) net momentum after 3 driven periods (neutral Si-C cell, should stay 0): {abs((MASS * V2).sum()):.1e}   (dipole velocity scale {np.abs(V2).max():.2f})")
-    # (6) exact idle propagator vs RK4 ring-down (harmonic)
-    Ph = Pads([(1 << 2) | (1 << 9)], 20.0); Ph.bb[:] = 0; Ph.tnl = 100; X0 = 0.1 * rng.standard_normal((1, NA)); V0 = 0.1 * rng.standard_normal((1, NA))
-    _, Xr, Vr = fire(Ph, cl, X0, V0, np.array([0.0]), (1, 0, 9)); Ph.tnl = 0
-    Xe, Ve = idle(Ph, cl, X0, V0, 10)
-    print(f"(6) 10-period free evolution, exact propagator vs RK4 (24 steps/period): relative state difference {np.abs(Xr - Xe).max() / np.abs(Xe).max():.1e}")
-    # figure: dispersion + oscillator strengths
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4)); qq = np.linspace(0, 2 * np.pi, 300); r_ = np.sqrt(h**2 - 4 * np.sin(qq / 2)**2 / (M_SI * M_C))
-    for sgn in (1, -1): ax[0].plot(qq / (2 * np.pi), fth(K0 * (h + sgn * r_)), "k-", lw=1)
-    ax[0].plot(q / (2 * np.pi), fth(K0 * (h + root)), "ro"); ax[0].plot(q / (2 * np.pi), fth(K0 * (h - root)), "bo")
-    ax[0].set_xlabel("q (units of 2pi/a)"); ax[0].set_ylabel("frequency (THz)"); ax[0].set_title("Si-C chain dispersion: lattice modes (dots) vs analytic")
-    for c, col in zip(range(P.C), ["k", "tab:blue", "tab:orange", "tab:red"]):
-        c_k = (SGN[None, :] / np.sqrt(MASS)[None, :] * vec[c].T).sum(1); wk = MU * c_k**2 / NCELL
-        ax[1].stem(fth(w2[c]) + 0.08 * c, np.maximum(wk, 1e-4), linefmt=col, markerfmt=col[0] if len(col) == 1 else "o", basefmt=" ", label=f"{bin(int(P.masks[c])).count('1')} defective bonds")
-    ax[1].set_yscale("log"); ax[1].set_ylim(1e-4, 1.5); ax[1].set_xlabel("mode frequency (THz)"); ax[1].set_ylabel("IR oscillator strength"); ax[1].legend(fontsize=8)
-    ax[1].set_title("defects detune/split the IR-active TO line"); fig.tight_layout(); fig.savefig("lattice_validation.png", dpi=110); print("saved lattice_validation.png\n")
+    image, layout, meta = make_mask(cells)
+    stem = f'physical_adder_mask_20mm_{cells}cells'
+    path = folder / (stem + '.png')
+    image.save(path, dpi=(DPI, DPI))
 
-# =====================================================================================================================
-# 5. SPEED-LIMIT STUDY (plain wait vs RZ anti-phase reset), real lattice dynamics
-# =====================================================================================================================
-def lane_pads(Q, nd, rng):
-    masks = np.array([draw_mask(n, rng) for n in nd], np.int64); um, inv = np.unique(masks, return_inverse=True); return Pads(um, Q), inv
+    with (folder / (stem + '.csv')).open('w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'cell',
+            'aperture',
+            'x_mm',
+            'y_mm',
+            'diameter_mm',
+        ])
+        writer.writerows(layout)
 
-def error_rate(Q, cyc, G=600, K=14, nmax=5, seed=3, ndef=None, calibrated=False):
-    rng = np.random.default_rng(seed); Th, a = thresholds(Q)
-    nd = rng.integers(0, nmax + 1, G) if ndef is None else np.full(G, int(ndef)); P, cls = lane_pads(Q, nd, rng)
-    if cyc[1] > 0:
-        if calibrated: calibrate_reset(P)
-        else: P.ra[:] = 1.0; P.rb[:] = 0.0                      # plain anti-phase copy of the drive
-    X = np.zeros((G, NA)); V = np.zeros((G, NA)); nbad = 0
-    for k in range(K):
-        s = rng.integers(0, 6, G).astype(float); amp, X, V = fire(P, cls, X, V, s, cyc); good = np.ones(G, bool)
-        for th in (1, 2, 3): good &= ((amp >= Th[th]) == (s >= th))
-        nbad += int((~good).sum())
-    return nbad / (G * K), a
+    (folder / (stem + '_notes.txt')).write_text(
+        f'20 x 20 mm mask at {DPI} DPI.\n'
+        f'{cells} cells: {meta["cols"]} columns x {meta["rows"]} rows.\n'
+        f'Nominal aperture diameter: {meta["diameter"]:.6f} mm.\n'
+        'White = open. Black = opaque. Print at actual size.\n'
+        'This mask implements bench adder cells, not SHA-256 rounds.\n'
+    )
 
-def study():
-    print(f"=== SPEED-LIMIT STUDY: 4H-SiC TO phonon {F0_HZ/1e12:.1f} THz, period {1e15/F0_HZ:.1f} fs, lattice pads (12 atoms) ===\n")
-    gaps = [0, 1, 3, 7, 15, 31, 63, 127, 255]; res = {}; Qs = (2, 20, 150)
-    print("A) PLAIN firing, drive 1 period then idle gap; random defects 0-5 per pad (random bond positions); error rate (fraction of firings with any wrong gate)")
-    print("   cycle(periods)  " + "  ".join(f"Q={Q:<4}" for Q in Qs))
-    for g in gaps:
-        row = [error_rate(Q, (1, 0, g), G=240, K=12)[0] for Q in Qs]; res[g] = row
-        print(f"   {1+g:>8} ({(1+g)*1e15/F0_HZ/1e3:7.2f} ps) " + "  ".join(f"{r:7.4f}" for r in row), flush=True)
-    print("\nB) RZ anti-phase reset (plain copy of the drive in anti-phase): drive 1 + cancel 1 period => cycle = 2 periods (%.0f fs)" % (2e15 / F0_HZ))
-    rz = {}
-    for Q in (2, 5, 20, 150, 1000):
-        e, a = error_rate(Q, (1, 1, 0), G=1200, K=20); rz[Q] = e
-        print(f"   Q={Q:<5} error rate {e:.5f}   (amp ratio s=2..5 vs s=1: {np.round(a[2:]/a[1], 2).tolist()})", flush=True)
-    print("\nB2) RZ with PER-PAD CALIBRATED cancellation pulse (amplitude+phase of the dipole mode nulled), cycle = 2 periods")
-    rzc = {}
-    for Q in (2, 5, 20, 150, 1000):
-        e, _ = error_rate(Q, (1, 1, 0), G=1200, K=20, calibrated=True); rzc[Q] = e; print(f"   Q={Q:<5} error rate {e:.5f}", flush=True)
-    print("\nC) calibrated RZ at Q=150 versus number of softened bonds in the pad:")
-    for n in range(0, 10):
-        e, _ = error_rate(150, (1, 1, 0), G=600, K=30, ndef=n, calibrated=True); print(f"   {n} defects: error rate {e:.5f}", flush=True)
-    scen = [("natural SiC Q~150, plain wait", 256), ("engineered Q~5 + calibrated RZ reset", 2 if rzc[5] < 1e-3 else 256)]
-    G_F, DEPTH = 60928, 2376; NQ, INP = 100, 3.0
-    e_hash = G_F * INP * NQ * HF; area = np.pi * 5.0**2; rows = []
-    print(f"\nSPEED  ({G_F:,} firings/hash, depth {DEPTH}, signal energy/hash {e_hash:.2e} J at {NQ} quanta/input; power cap = 100 W/cm2 of signal heat)")
-    for sname, cyc in scen:
-        tc = cyc / F0_HZ; print(f" [{sname}]  cycle {cyc} periods = {tc*1e15:.0f} fs, latency {DEPTH*tc*1e12:.0f} ps")
-        for name, pitch_um in (("100 mm wafer, 10 um pads", 10), ("100 mm wafer, 2 um pads", 2), ("100 mm wafer, 1 um pads", 1)):
-            Pn = int(np.pi * 50e3**2 / pitch_um**2); thr = Pn / (G_F * tc); cap = 100 * area / e_hash
-            rows.append((sname, name, Pn, thr, min(thr, cap)))
-            print(f"    {name:<26} pads {Pn:>14,}  speed-limit {thr:9.2e} H/s  power-cap {cap:9.2e}  -> {min(thr, cap):9.2e} H/s")
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-    for i, Q in enumerate(Qs): ax[0].semilogy([1 + g for g in gaps], [max(res[g][i], 1e-4) for g in gaps], "o-", label=f"plain, Q={Q}")
-    ax[0].axhline(1e-4, c="gray", ls=":"); ax[0].set_xscale("log"); ax[0].set_xlabel("cycle time (periods of 24 THz)"); ax[0].set_ylabel("error rate (floor 1e-4 = none seen)")
-    ax[0].plot([2], [max(rz[150], 1e-4)], "kx", ms=10, label="uncalibrated RZ Q=150, 2 periods"); ax[0].plot([2], [max(rzc[150], 1e-4)], "r*", ms=14, label="calibrated RZ Q=150, 2 periods")
-    ax[0].plot([2], [max(rzc[5], 1e-4)], "g^", ms=9, label="calibrated RZ Q=5, 2 periods"); ax[0].legend(fontsize=7); ax[0].set_title("Back-to-back firing: plain wait vs RZ reset (lattice pads)")
-    lab = [f"{r[0].split(' ')[0]}/{r[1].split(', ')[1]}" for r in rows]
-    ax[1].bar(range(len(rows)), [r[4] for r in rows], color=["#7f8c8d"] * 3 + ["#c0392b"] * 3); ax[1].set_yscale("log")
-    ax[1].set_xticks(range(len(rows))); ax[1].set_xticklabels(lab, fontsize=6, rotation=30); ax[1].set_ylabel("H/s (min of speed and power caps)")
-    ax[1].set_title("grey: natural Q~150 | red: engineered Q~5 + RZ")
-    fig.tight_layout(); fig.savefig("ir_phonon_speed_limit.png", dpi=110); print("saved ir_phonon_speed_limit.png\n")
+    return path, image, meta
 
-# =====================================================================================================================
-# 6. RUN THE NETLIST ON THE LATTICE PADS (state carried between firings, idle pads decay)
-# =====================================================================================================================
-def run_net_state(net, inw, bits_list, pad_ok, Np, cls_pad, P, Th, cyc, log=True):
-    B = len(bits_list); nw = len(net.lvl); val = np.zeros((B, nw), np.int8); val[:, 1] = 1
-    for b, bits in enumerate(bits_list): val[b, inw] = bits
-    gi = np.array(net.gi); gw = np.array(net.gw, float); gth = np.array(net.gth); go = np.array(net.gout)
-    lv = np.array([net.lvl[w] for w in go]); order = np.argsort(lv, kind="stable"); lvs = lv[order]; maxL = int(lvs.max())
-    bounds = np.searchsorted(lvs, np.arange(1, maxL + 2)); al = {}
-    for w, src in net.alias: al.setdefault(net.lvl[w], []).append((w, src))
-    al = {L: (np.array([x[0] for x in v_]), np.array([x[1] for x in v_])) for L, v_ in al.items()}
-    def do_alias(L):
-        if L in al: val[:, al[L][0]] = 1 - val[:, al[L][1]]
-    do_alias(0)
-    cper = sum(cyc); X = np.zeros((Np, NA)); V = np.zeros((Np, NA)); last = np.full(Np, -1, np.int64); slot = 0
-    pad_of = np.zeros(len(go), int); off = 0; wrong = 0; fired = 0; lo_full = 0.0; lo_dip = 0.0; t0 = time.time()
-    for L in range(1, maxL + 1):
-        idx = order[bounds[L - 1]:bounds[L]]
-        if len(idx):
-            n = len(idx); tot = B * n; Lc = len(pad_ok)
-            sdr = (val[:, gi[idx]] * gw[idx][None]).sum(-1).reshape(-1); thr = np.tile(gth[idx], B)
-            pads_all = pad_ok[(off + np.arange(tot)) % Lc]; off += tot; outs = np.zeros(tot, np.int8)
-            for c0 in range(0, tot, Lc):                       # one chunk = one time slot of up to Lc distinct pads
-                sl_ = slice(c0, min(tot, c0 + Lc)); pp = pads_all[sl_]
-                el = np.where(last[pp] < 0, 0, (slot - last[pp] - 1) * cper)       # idle slots since this pad last fired
-                amp, xn, vn = fire(P, cls_pad[pp], X[pp], V[pp], sdr[sl_], cyc, elapsed=el)
-                X[pp] = xn; V[pp] = vn; last[pp] = slot; slot += 1; outs[sl_] = (amp >= Th[thr[sl_]])
-                lo_full = max(lo_full, float(np.sqrt((xn**2 + vn**2).sum(1)).max()))
-                lo_dip = max(lo_dip, float(np.hypot(dip(xn), vn[:, 0::2].mean(1) - vn[:, 1::2].mean(1)).max()))
-            wrong += int((outs != (sdr >= thr)).sum()); fired += tot
-            val[:, go[idx]] = outs.reshape(B, n); pad_of[idx] = pads_all[:n]
-        do_alias(L)
-        if log and L % 300 == 0: print(f"  level {L}/{maxL}  ({time.time()-t0:.0f}s)", flush=True)
-    return val, pad_of, lv, dict(chunks=slot, wrong=wrong, fired=fired, leftover=lo_full, leftover_dip=lo_dip)
 
-# =====================================================================================================================
-# 7. ANIMATION
-# =====================================================================================================================
-def animate(sites, tsd, bpd, ndef, E, bits, snaps, recpad, msg, ref, ok, traces, net_res, tag="ir_phonon_full_sha256", cyc=(1, 1, 0)):
-    from matplotlib.animation import FuncAnimation, PillowWriter
-    from matplotlib.patches import Rectangle, Circle, Patch
-    from matplotlib.lines import Line2D
-    from matplotlib.colors import ListedColormap
-    val, pad_of, lv, round_end, state_w, dig, ngates = net_res
-    NS = len(sites); med = np.median(E)
-    Epad = E.reshape(NS, 5).mean(1); Epn = (Epad - Epad.min()) / (Epad.max() - Epad.min())
-    amp = np.percentile(np.abs(snaps), 99.7)
-    wavecm = matplotlib.colormaps["seismic"]; heatcm = matplotlib.colormaps["inferno"]; viri = matplotlib.colormaps["viridis"]
-    xs = (np.arange(NG) + .5) * DX - WAFER_R; Xg, Yg = np.meshgrid(xs, xs); inside = np.hypot(Xg, Yg) <= WAFER_R
-    block = msg + b"\x80" + b"\x00" * (55 - len(msg)) + (8 * len(msg)).to_bytes(8, "big")
-    block_bits = np.array([(by >> (7 - k)) & 1 for by in block for k in range(8)])
-    digest = [word_val(val[0], w) for w in dig]; dhex = "".join(f"{w:08x}" for w in digest)
-    NB_, NR, NSF, NC, ND = len(snaps), 8, 8, 48, 12
-    F1, F2, F3, F4 = NB_, NB_ + NR, NB_ + NR + NSF, NB_ + NR + NSF + NC; NF = F4 + ND
-    maxL = int(lv.max()); Lf = np.ceil(maxL * np.arange(NC + 1) / NC).astype(int)
-    ids = np.arange(len(lv)); permin = np.full(maxL + 2, len(lv)); np.minimum.at(permin, lv, ids)
-    minid = np.minimum.accumulate(permin[::-1])[::-1]; ranks = np.array(round_end)
-    heat_f = []; ng_f = []
-    for c in range(NC):
-        sel = (lv > Lf[c]) & (lv <= Lf[c + 1]); heat_f.append(np.bincount(pad_of[sel], minlength=NS)); ng_f.append(int(sel.sum()))
-    cum_f = np.cumsum(ng_f); rdone_f = [int(np.searchsorted(ranks, minid[min(Lf[c + 1] + 1, maxL + 1)], side="left")) for c in range(NC)]
-    t_ax = (np.arange(traces.shape[2]) + 1) * DT / (2 * np.pi); t_drive = cyc[0]
-    fig = plt.figure(figsize=(12.5, 7.8))
-    axw = fig.add_axes([0.02, 0.28, 0.42, 0.63]); axr = fig.add_axes([0.47, 0.69, 0.51, 0.22])
-    axm = fig.add_axes([0.52, 0.47, 0.46, 0.14]); axt = fig.add_axes([0.47, 0.265, 0.51, 0.17]); axt.axis("off")
-    title = fig.text(0.5, 0.955, "", ha="center", fontsize=14, fontweight="bold")
-    fig.text(0.02, 0.008, "Acoustic blast = real 2-D wave FDTD.  Pads = 12-atom Si-C lattices (masses, bond springs, anharmonicity, Born-charge IR drive, RK4) at "
-             "the 23.9 THz TO phonon; defects = softened bonds; lattice state persists between firings.  Constants assumed; gain/readout/routing not modelled.", fontsize=6.4, color="#555")
-    axw.add_patch(Circle((0, 0), WAFER_R, fill=False, lw=3, color="#2c3e50", zorder=6)); patches = []
-    for k, (sx, sy, x0, y0) in enumerate(sites):
-        p = Rectangle((x0, y0), SITE, SITE, fc="#f2f3f4", ec="#566573", lw=1.2, zorder=1); axw.add_patch(p); patches.append(p)
-        axw.text(sx, sy, str(ndef[k]), ha="center", va="center", fontsize=6, color="#2c3e50", zorder=7)
-    axw.scatter(*tsd.T, marker="x", c="#c0392b", s=9, lw=.8, zorder=5); axw.scatter(*bpd.T, marker="s", c="#e67e22", s=7, zorder=5)
-    pr = np.array([[s_[0] + dx, s_[1] + dy] for s_ in sites for dx, dy in PROBES])
-    probe_sc = axw.scatter(pr[:, 0], pr[:, 1], s=3, c="#2c3e50", zorder=8, visible=False)
-    im = axw.imshow(np.zeros((NG, NG, 4)), extent=[-WAFER_R, WAFER_R, -WAFER_R, WAFER_R], origin="lower", zorder=3, interpolation="bilinear")
-    axw.set_xlim(-WAFER_R * 1.05, WAFER_R * 1.05); axw.set_ylim(-WAFER_R * 1.05, WAFER_R * 1.05); axw.set_aspect("equal"); axw.set_xticks([]); axw.set_yticks([])
-    axw.set_title("Patterned SiC wafer: pads (digit = defects in pad), TSD x, BPD \u25a0", fontsize=10)
-    regcmap = ListedColormap(["#ecf0f1", "#ffffff", "#00bcd4", "#e8daef", "#8e44ad"])
-    reg = axr.imshow(np.zeros((16, 32)), cmap=regcmap, vmin=0, vmax=4, aspect="auto")
-    axr.set_xticks(np.arange(-.5, 32, 1), minor=True); axr.set_yticks(np.arange(-.5, 16, 1), minor=True)
-    axr.grid(which="minor", color="#aab7b8", lw=.4); axr.tick_params(which="both", length=0)
-    axr.set_xticks([0, 31]); axr.set_xticklabels(["b31", "b0"], fontsize=7); axr.set_yticks([0, 15]); axr.set_yticklabels(["W0", "W15"], fontsize=7)
-    axr.set_title("SHA-256 512-bit input block (16 words x 32 bits)", fontsize=9)
-    handles = [
-        Patch(fc="#f2f3f4", ec="#566573", label="Pad (idle); digit = defects inside"),
-        Line2D([], [], marker="x", ls="", c="#c0392b", label="TSD defect"), Line2D([], [], marker="s", ls="", c="#e67e22", label="BPD defect"),
-        Patch(fc="#d62728", alpha=.7, label="Acoustic wave: +u"), Patch(fc="#1f3fbf", alpha=.7, label="Acoustic wave: -u"),
-        Line2D([], [], marker=".", ls="", c="#2c3e50", label="Probe points (5 per pad)"),
-        Patch(fc=viri(.8), label="Pad coloured by received acoustic energy"),
-        Patch(fc="#2ecc71", ec="#1e8449", label="Pad passes lattice self-test (with history)"),
-        Patch(fc="#bdc3c7", ec="#7f8c8d", hatch="///", label="Pad masked (defects break logic)"),
-        Patch(fc=heatcm(.85), label="Pad firing (brighter = more gates)"),
-        Line2D([], [], c="#2980b9", label="Pad dipole d(t): drive sum 0"), Line2D([], [], c="#27ae60", label="drive sum 1"),
-        Line2D([], [], c="#e67e22", label="drive sum 2"), Line2D([], [], c="#c0392b", label="drive sum 3"),
-        Line2D([], [], c="k", ls="--", label="end of drive window (reset pulse follows)"),
-        Patch(fc="#ecf0f1", ec="#aab7b8", label="Input bit: empty"), Patch(fc="#ffffff", ec="#aab7b8", label="Input bit = 0"),
-        Patch(fc="#00bcd4", ec="#aab7b8", label="Input bit = 1"), Patch(fc="#8e44ad", ec="#aab7b8", label="Padding bit = 1 (light = 0)"),
-    ]
-    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=6.8, title="Legend", title_fontsize=7.5, bbox_to_anchor=(0.5, 0.022), frameon=True)
-    order_def = np.argsort(-ndef); tcol = ["#2980b9", "#27ae60", "#e67e22", "#c0392b"]
-    wave_pads = [int(np.argmin(ndef)), int(np.argsort(ndef)[NS // 2]), int(np.argmax(ndef))]
-    def update(f):
-        axm.clear(); text = []; nbits = 0; im.set_visible(False); probe_sc.set_visible(False)
-        for k, p in enumerate(patches): p.set_facecolor("#f2f3f4"); p.set_hatch(None)
-        if f < F1:
-            u = np.where(inside, snaps[f], 0) / amp; rgba = wavecm(0.5 + 0.5 * np.clip(u, -1, 1)); rgba[..., 3] = np.clip(np.abs(u) * 1.6, 0, .9)
-            im.set_data(rgba); im.set_visible(True); title.set_text("1. Blast the patterned wafer with sound (ring transducer, real wave FDTD)")
-            tmax = len(recpad); tcur = f * 14
-            for wp, c in zip(wave_pads, ["#2980b9", "#27ae60", "#c0392b"]): axm.plot(recpad[:, wp], c=c, lw=.8, label=f"pad {wp}: {ndef[wp]} defects")
-            axm.axvline(tcur, c="k", lw=1); axm.set_xlim(0, tmax); axm.legend(fontsize=6, loc="upper right")
-            axm.set_title("displacement u(t) at pad centres (x = time step); defects scatter and reshape the echo", fontsize=8); axm.tick_params(labelsize=7)
-            text = [f"time step {tcur}/{tmax}   tone burst 3 cycles, wavelength 8 cells = 4 mm", "scalar wave eq.  u_tt = c^2 lap(u) - damping;  trenches slow c, defects scatter strongly"]
-        elif f < F2:
-            n = f - F1 + 1; nbits = min(440, 55 * n); npads = min(NS, int(np.ceil(NS * n / NR)))
-            for k in range(NS): patches[k].set_facecolor(viri(Epn[k]) if k < npads else "#f2f3f4")
-            probe_sc.set_visible(True); title.set_text("2. Pads listen: received acoustic energy at 5 probes per pad -> bits")
-            order = np.argsort(E); axm.scatter(range(len(E)), E[order], s=5, c=np.where(bits[order] == 1, "#00bcd4", "#7f8c8d"))
-            axm.axhline(med, c="k", ls="--", lw=1); axm.set_title("probe energies (sorted): above median -> 1", fontsize=8); axm.tick_params(labelsize=7)
-            text = [f"bits so far: {nbits}/440   ones: {bits[:max(nbits,1)].mean()*100:.1f}%", "E = sum_t u(t)^2 at each probe;  bit = [E >= median]"]
-        elif f < F3:
-            nbits = 440; n = f - F2 + 1; nshow = min(NS, int(np.ceil(NS * n / NSF)))
-            for k in range(NS):
-                if k < nshow: patches[k].set_facecolor("#2ecc71" if ok[k] else "#bdc3c7"); patches[k].set_hatch(None if ok[k] else "///")
-            pp = order_def[(n - 1) % NS] if n < NSF else order_def[0]
-            for c in range(4): axm.plot(t_ax, traces[pp, c], c=tcol[c], lw=1.1)
-            axm.axvline(t_drive, c="k", ls="--", lw=.8); axm.tick_params(labelsize=7); axm.set_xlabel("time (fundamental periods)", fontsize=7)
-            axm.set_title(f"self-test pad {pp} ({ndef[pp]} defects): lattice dipole d(t) for drive sums 0-3", fontsize=8)
-            title.set_text("3. Each defect pad self-tests (with history) as a 24 THz phonon-lattice gate")
-            text = [f"pads usable: {ok.sum()}/{NS}   masked: {(~ok).sum()}", "pad = 12-atom Si-C lattice, defects = softened bonds at random positions",
-                    "out = [lock-in amplitude of the dipole >= theta threshold]; full adder = 2 pads"]
-        elif f < F4:
-            nbits = 440; c = f - F3
-            for k in range(NS):
-                if ok[k]: patches[k].set_facecolor(heatcm(min(1, heat_f[c][k] / max(1, heat_f[c].max()) * .95)))
-                else: patches[k].set_facecolor("#bdc3c7"); patches[k].set_hatch("///")
-            pp = [p for p in np.argsort(-heat_f[c]) if ok[p]][0]
-            for cc in range(4): axm.plot(t_ax, traces[pp, cc], c=tcol[cc], lw=1.1)
-            axm.axvline(t_drive, c="k", ls="--", lw=.8); axm.tick_params(labelsize=7)
-            axm.set_title(f"busiest pad now: pad {pp} ({ndef[pp]} defects), fired {heat_f[c][pp]}x in this slice", fontsize=8)
-            r = rdone_f[c]; title.set_text("4. 24 THz defect pads fire gates (lattice state carried over): SHA-256, 64 rounds")
-            text = [f"gate firings: {int(cum_f[c]):,}/{ngates:,}  (1 gate per pad firing)", f"rounds completed: {r:2d}/64   " + "#" * (r // 2) + "." * (32 - r // 2)]
-            if r >= 1:
-                st = [word_val(val[0], w) for w in state_w[r - 1]]
-                text += [f"a={st[0]:08x} b={st[1]:08x} c={st[2]:08x} d={st[3]:08x}", f"e={st[4]:08x} f={st[5]:08x} g={st[6]:08x} h={st[7]:08x}  (read from pads)"]
+# ---------------------------------------------------------------------------
+# Optical full-adder bench
+# ---------------------------------------------------------------------------
+
+class ITOPlate:
+    """Simulated ITO IR-blocking plate. Parameter values are assumptions."""
+
+    def __init__(
+        self,
+        enabled=False,
+        extinction_db=20.0,
+        loss=0.08,
+        reject_db=15.0,
+        tau_us=50.0,
+        settle_us=250.0,
+    ):
+        self.enabled = bool(enabled)
+        self.extinction_db = extinction_db
+        self.loss = loss
+        self.reject_db = reject_db
+        self.tau_us = tau_us
+        self.settle_us = settle_us
+
+    @property
+    def p_on(self):
+        return 1.0 - self.loss
+
+    @property
+    def p_off(self):
+        return 10 ** (-self.extinction_db / 10)
+
+    @property
+    def ambient_factor(self):
+        return 10 ** (-self.reject_db / 10)
+
+    @property
+    def decay(self):
+        if self.tau_us <= 0:
+            return 0.0
+        return math.exp(-self.settle_us / self.tau_us)
+
+    def step(self, current, target_bit):
+        target = self.p_on if target_bit else self.p_off
+        return target + (current - target) * self.decay
+
+
+class CameraBench:
+    def __init__(
+        self,
+        cells,
+        exposure=0.22,
+        leak=0.001,
+        noise=0.002,
+        seed=1,
+        led_a=True,
+        led_b=True,
+        ito=None,
+        ambient=0.04,
+        xtalk=0.02,
+    ):
+        self.cells = cells
+        self.exposure = exposure
+        self.leak = leak
+        self.noise = noise
+        self.rng = random.Random(seed)
+        self.led_a = led_a
+        self.led_b = led_b
+        self.ito = ito if ito is not None else ITOPlate(False)
+        self.ambient = ambient
+        self.xtalk = xtalk
+
+        self.itx = [
+            [self.ito.p_off] * 5
+            for _ in range(cells)
+        ]
+        self.pbits = [
+            [0] * 5
+            for _ in range(cells)
+        ]
+
+        self.exposures = 0
+        self.last = None
+        self.worst_margin = 0.0
+        self.err_sq = 0.0
+        self.err_n = 0
+        self.plate_time_us = 0.0
+        self.useful_slots = 0
+        self.idle_slots = 0
+
+    @property
+    def rms_error(self):
+        if self.err_n == 0:
+            return 0.0
+        return math.sqrt(self.err_sq / self.err_n)
+
+    @property
+    def exposure_seconds(self):
+        return self.exposures * EXPOSURE_TIME_S
+
+    def capture(self, inputs, active=None):
+        n = self.cells
+
+        if len(inputs) != n:
+            raise ValueError(
+                f'Exactly {n} input lanes are required.'
+            )
+
+        act = [True] * n if active is None else list(active)
+
+        if len(act) != n:
+            raise ValueError(
+                f'Exactly {n} active flags are required.'
+            )
+
+        self.useful_slots += sum(act)
+        self.idle_slots += n - sum(act)
+
+        use_ito = self.ito.enabled
+        ambient = self.ambient * (
+            self.ito.ambient_factor if use_ito else 1.0
+        )
+        dark = 0.01 + ambient
+        noise_sigma = math.sqrt(
+            self.noise ** 2 + SHOT_K ** 2 * ambient
+        )
+        exposure = self.exposure
+        lit = sum(act) if use_ito else n
+        stray = self.xtalk * exposure * lit / n
+        p_on = self.ito.p_on if use_ito else 1.0
+        closed = self.leak * (
+            self.ito.p_off if use_ito else 1.0
+        )
+        lambda_closed = closed / p_on
+        led_a = float(self.led_a)
+        led_b = float(self.led_b)
+
+        def transmission(bit):
+            return self.leak + (1.0 - self.leak) * bit
+
+        def pixel(value):
+            return max(
+                0.0,
+                min(
+                    1.0,
+                    value + self.rng.gauss(0, noise_sigma)
+                )
+            )
+
+        rows = []
+        changed = False
+
+        for i, (a, b, carry) in enumerate(inputs):
+            if a not in (0, 1) or b not in (0, 1) or carry not in (0, 1):
+                raise ValueError(
+                    'Optical inputs must be binary.'
+                )
+
+            if use_ito:
+                idle = not act[i]
+                target_bits = (
+                    (0, 0, 0, 0, 0)
+                    if idle
+                    else (a, b, carry, 1, 1)
+                )
+
+                if list(target_bits) != self.pbits[i]:
+                    changed = True
+                    self.pbits[i] = list(target_bits)
+
+                for j in range(5):
+                    self.itx[i][j] = self.ito.step(
+                        self.itx[i][j],
+                        target_bits[j]
+                    )
+
+                pa, pb, pc, ref_a, ref_b = self.itx[i]
+
+            else:
+                pa = pb = pc = ref_a = ref_b = 1.0
+
+            signal = dark + stray + exposure * (
+                led_a * (
+                    transmission(a) * pa
+                    + transmission(b) * pb
+                )
+                + led_b * transmission(carry) * pc
+            )
+            black = dark
+            ref_a_level = dark + stray + exposure * led_a * ref_a
+            ref_b_level = dark + stray + exposure * led_b * ref_b
+            baseline = dark + stray + exposure * closed * (
+                2 * led_a + led_b
+            )
+
+            rows.append({
+                'signal': pixel(signal),
+                'black': pixel(black),
+                'refa': pixel(ref_a_level),
+                'refb': pixel(ref_b_level),
+                'baseline': pixel(baseline),
+            })
+
+        self.exposures += 1
+
+        if use_ito and changed:
+            self.plate_time_us += self.ito.settle_us
+
+        decoded = []
+
+        for i, row in enumerate(rows):
+            if use_ito and not act[i]:
+                decoded.append({
+                    'level': 0.0,
+                    'k': 0,
+                    'sum': 0,
+                    'carry': 0,
+                })
+                continue
+
+            ref_a = row['refa'] - row['black']
+            ref_b = row['refb'] - row['black']
+
+            if min(ref_a, ref_b) < 0.04:
+                raise RuntimeError(
+                    'Insufficient LED reference signal.'
+                )
+
+            if abs(ref_a - ref_b) > 0.25 * max(ref_a, ref_b):
+                raise RuntimeError(
+                    'Unequal LED references.'
+                )
+
+            level = (
+                row['signal'] - row['baseline']
+            ) / (
+                (ref_a + ref_b) / 2 * (1 - lambda_closed)
+            )
+            k = round(level)
+
+            self.worst_margin = max(
+                self.worst_margin,
+                abs(level - k)
+            )
+            self.err_sq += (level - k) ** 2
+            self.err_n += 1
+
+            if row['signal'] > 0.98:
+                raise RuntimeError(
+                    'Camera signal saturated. Lower exposure.'
+                )
+
+            if not 0 <= k <= 3 or abs(level - k) > 0.35:
+                raise RuntimeError(
+                    'Ambiguous camera level. '
+                    'Lower exposure or noise.'
+                )
+
+            decoded.append({
+                'level': level,
+                'k': k,
+                'sum': k % 2,
+                'carry': int(k >= 2),
+            })
+
+        self.last = {
+            'inputs': list(inputs),
+            'rows': rows,
+            'decoded': decoded,
+        }
+        return decoded
+
+
+def optical_add(
+    bench,
+    x_values,
+    y_values,
+    width,
+    active=None,
+):
+    """Lane-parallel optical addition."""
+    n = bench.cells
+
+    if len(x_values) != n or len(y_values) != n:
+        raise ValueError(
+            f'optical_add requires exactly {n} lanes.'
+        )
+
+    carry = [0] * n
+    result = [0] * n
+    act = [True] * n if active is None else list(active)
+
+    for bit in range(width):
+        inputs = []
+
+        for i in range(n):
+            inputs.append((
+                (x_values[i] >> bit) & 1,
+                (y_values[i] >> bit) & 1,
+                carry[i],
+            ))
+
+        decoded = bench.capture(inputs, act)
+
+        for i, d in enumerate(decoded):
+            result[i] |= d['sum'] << bit
+            carry[i] = d['carry']
+
+        yield {
+            'bit': bit,
+            'width': width,
+            'stage': (
+                f'optical add bit {bit + 1}/{width}'
+            ),
+        }
+
+    if any(carry):
+        raise RuntimeError('Optical addition overflow.')
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 proof-of-work
+# ---------------------------------------------------------------------------
+
+def sha256d(data):
+    return hashlib.sha256(
+        hashlib.sha256(data).digest()
+    ).digest()
+
+
+def leading_zero_bits(digest):
+    count = 0
+
+    for byte in digest:
+        if byte == 0:
+            count += 8
         else:
-            nbits = 440; nw = min(8, f - F4 + 1)
-            for k in range(NS):
-                if ok[k]: patches[k].set_facecolor("#2ecc71")
-                else: patches[k].set_facecolor("#bdc3c7"); patches[k].set_hatch("///")
-            axm.axis("off"); title.set_text("5. Digest read from pad outputs - checked against hashlib")
-            text = [" ".join(f"{digest[i]:08x}" if i < nw else "........" for i in range(4)), " ".join(f"{digest[i]:08x}" if i < nw else "........" for i in range(4, 8))]
-            if nw == 8: text.append("pads == hashlib:  " + ("PASS" if dhex == ref else "FAIL"))
-        data = np.zeros(512, dtype=int); data[:nbits] = 1 + bits[:nbits]
-        if f >= F3: data[440:] = 3 + block_bits[440:]
-        reg.set_data(data.reshape(16, 32)); axt.clear(); axt.axis("off")
-        axt.text(0.0, 1.0, "\n".join(text), va="top", ha="left", family="monospace", fontsize=8.3); return []
-    anim = FuncAnimation(fig, update, frames=NF, interval=90, blit=False)
-    anim.save(f"{tag}.gif", writer=PillowWriter(fps=11), dpi=62)
-    update(8); fig.savefig("full_blast.png", dpi=80); update(F3 + 24); fig.savefig("full_compute.png", dpi=80); update(NF - 1); fig.savefig("full_digest.png", dpi=80)
-    print(f"saved {tag}.gif ({NF} frames)", flush=True)
+            count += 8 - byte.bit_length()
+            break
 
-# =====================================================================================================================
-# 8. FULL SCENARIO RUN
-# =====================================================================================================================
-def run_scenario(sc, skip_micro=False, anim=True):
-    sites, tsd, bpd, ndef = make_wafer(); D = load_or_make_messages(sites, tsd, bpd); bl, refs = D["bits"], D["refs"]
-    p = SCEN[sc]; Q, cyc = p["Q"], p["cyc"]; tc = sum(cyc) / F0_HZ; Th, _ = thresholds(Q)
-    # --- pad populations: random defect POSITIONS inside every pad
-    rngw = np.random.default_rng(11); wmask = np.array([draw_mask(n, rngw) for n in ndef], np.int64)
-    Pm = int(np.pi * WAFER_R**2 / 0.1**2); rng = np.random.default_rng(5); ndm = np.zeros(Pm, int)
-    for k in rng.integers(0, Pm, len(tsd) + len(bpd)): ndm[k] += 1
-    mmask = np.zeros(Pm, np.int64)
-    for k in np.nonzero(ndm)[0]: mmask[k] = draw_mask(ndm[k], rng)
-    um = np.unique(np.concatenate([[0], wmask, mmask[ndm > 0]])); cls_w = np.searchsorted(um, wmask); cls_m = np.searchsorted(um, mmask)
-    P = Pads(um, Q)
-    if p["reset"]: calibrate_reset(P)
-    print(f"[{sc}] Q={Q}, cycle {sum(cyc)} periods = {tc*1e15:.0f} fs, thresholds {np.round(Th[1:], 4).tolist()}, {P.C} distinct pad lattices; "
-          f"reset(a,b) perfect pad: ({P.ra[0]:.3f},{P.rb[0]:.3f})", flush=True)
-    t0 = time.time(); ok_c = stress(P, Th, cyc); nbd = np.array([bin(int(m)).count("1") for m in um])
-    print(f"pad self-test with history ({time.time()-t0:.0f}s), lattices passing by number of defective bonds: " +
-          "  ".join(f"{n}:{int(ok_c[nbd == n].sum())}/{int((nbd == n).sum())}" for n in range(int(nbd.max()) + 1) if (nbd == n).any()), flush=True)
-    net, inw, rend, stw, dig = build_sha_net(440); ng = len(net.gout); depth = int(max(net.lvl)); print(f"netlist {ng:,} firings, depth {depth}", flush=True)
-    ok = ok_c[cls_w]; ok_idx = np.where(ok)[0]
-    if sc == "fast" or skip_micro:                             # --- the 88-pad wafer, one hash
-        val, pad_of, lv, st = run_net_state(net, inw, [bl[0]], ok_idx, len(ndef), cls_w, P, Th, cyc)
-        d0 = "".join(f"{word_val(val[0], w):08x}" for w in dig)
-        print(f"[wafer, {ok.sum()}/88 usable pads] digest {d0}\n  hashlib {refs[0]} -> {'PASS' if d0 == refs[0] else 'FAIL'}; raw gate errors {st['wrong']}/{st['fired']:,}; "
-              f"pad-time slots {st['chunks']:,} -> {st['chunks']*tc*1e9:.3f} ns/hash; leftover ringing after a firing: dipole {st['leftover_dip']:.2e}, whole lattice {st['leftover']:.2e}", flush=True)
-    if not skip_micro:                                         # --- micro-pad array, 16 hashes pipelined
-        okm = ok_c[cls_m]
-        valm, _, lvm, st2 = run_net_state(net, inw, bl, np.where(okm)[0], Pm, cls_m, P, Th, cyc)
-        dm = ["".join(f"{word_val(valm[b], w):08x}" for w in dig) for b in range(16)]; npass = sum(dm[b] == refs[b] for b in range(16))
-        print(f"[micro-pad array {Pm:,} pads ({(~okm).sum()} masked), 16 pipelined hashes] {npass}/16 digests match hashlib; raw gate errors {st2['wrong']}/{st2['fired']:,}; "
-              f"leftover ringing: dipole {st2['leftover_dip']:.2e}, lattice {st2['leftover']:.2e}; batch time {st2['chunks']*tc*1e12:.1f} ps (latency-bound)", flush=True)
-        cap = Pm / (ng * tc); print(f"capacity of this array at this cycle: {cap:.2e} H/s (needs ~{cap*len(set(lvm.tolist()))*tc:,.0f} hashes in flight)", flush=True)
-    if (sc == "fast" or skip_micro) and anim:
-        tr = np.zeros((len(ndef), 4, (cyc[0] + cyc[1]) * SPP)); z = np.zeros((len(ndef), NA))
-        for s_ in range(4): tr[:, s_, :] = fire(P, cls_w, z, z, np.full(len(ndef), float(s_)), cyc, trace=True)[3].T
-        animate(sites, tsd, bpd, ndef, D["E0"], bl[0], D["snaps"], D["recpad"], D["msgs"][0], refs[0], ok, tr, (val, pad_of, lv, rend, stw, dig, ng), cyc=cyc)
+    return count
 
-if __name__ == "__main__":
-    a = sys.argv[1:]
-    if "--prep" in a:
-        s_, t_, b_, _ = make_wafer(); load_or_make_messages(s_, t_, b_, force=True); sys.exit()
-    todo = []
-    if "--all" in a: todo = ["validate", "study", "fast", "q20"]
-    if "--validate" in a: todo.append("validate")
-    if "--study" in a: todo.append("study")
-    if "--scen" in a: todo.append(a[a.index("--scen") + 1])
-    if not todo: todo = ["validate", "fast"]
-    for job in todo:
-        if job == "validate": validate()
-        elif job == "study": study()
-        else: run_scenario(job, skip_micro="--skip-micro" in a, anim="--no-anim" not in a)
+
+def default_header():
+    version = struct.pack('<I', 0x20000000)
+    previous = bytes(32)
+    merkle = hashlib.sha256(
+        b'IR-bench example merkle root'
+    ).digest()
+    timestamp = struct.pack('<I', int(time.time()))
+    bits = struct.pack('<I', 0x1702b3f7)
+
+    return version + previous + merkle + timestamp + bits
+
+
+def parse_header_hex(text):
+    try:
+        raw = bytes.fromhex(''.join(text.split()))
+    except ValueError:
+        raise ValueError(
+            'Header must be valid hexadecimal.'
+        )
+
+    if len(raw) != 76:
+        raise ValueError(
+            f'Header must be exactly 76 bytes, not {len(raw)}.'
+        )
+
+    return raw
+
+
+def pow_job(
+    bench,
+    header,
+    start_nonce,
+    end_nonce,
+    difficulty,
+    report,
+):
+    """Optical nonce generation plus real CPU SHA-256 validation."""
+    n = bench.cells
+    total = end_nonce - start_nonce + 1
+    expected = 2 ** difficulty
+
+    if start_nonce < 0 or end_nonce > 0xFFFFFFFF:
+        raise ValueError(
+            'Nonce values must fit in 32 bits.'
+        )
+
+    if end_nonce < start_nonce:
+        raise ValueError(
+            'Nonce end must be greater than or equal to nonce start.'
+        )
+
+    if total > MAX_HASHES:
+        raise ValueError(
+            f'Nonce range too large: '
+            f'{total:,} > {MAX_HASHES:,}.'
+        )
+
+    if expected > MAX_HASHES:
+        raise ValueError(
+            f'Difficulty too high: expected about '
+            f'{expected:,} hashes.'
+        )
+
+    report(
+        f'PoW started: {n} lanes, difficulty {difficulty}, '
+        f'nonce range {start_nonce:,}..{end_nonce:,}, '
+        f'{total:,} candidates, expected about '
+        f'{expected:,} hashes.'
+    )
+    report(
+        f'Timing model: {EXPOSURE_TIME_MS:.1f} ms per optical exposure. '
+        'Bench hash rate = hashes / (exposures * 0.001 s).'
+    )
+    report(
+        'CPU computes SHA256(SHA256(header||nonce)); '
+        'optics performs lane addition and exposures.'
+    )
+
+    started = time.perf_counter()
+    hashes = 0
+    batches = 0
+    solution = None
+    nonce = start_nonce
+
+    while nonce <= end_nonce and solution is None:
+        lane_count = min(n, end_nonce - nonce + 1)
+        active = [i < lane_count for i in range(n)]
+        base = [nonce] * n
+        offsets = list(range(n))
+
+        adder = optical_add(
+            bench,
+            base,
+            offsets,
+            33,
+            active,
+        )
+
+        while True:
+            try:
+                event = next(adder)
+            except StopIteration as stop:
+                optical_nonces = stop.value
+                break
+
+            exposure_hash_rate = hashes / max(
+                bench.exposure_seconds,
+                EXPOSURE_TIME_S
+            )
+
+            event['stage'] = (
+                f'batch {batches + 1}, '
+                f'lanes {lane_count}, '
+                f'base nonce {nonce:,}, '
+                f'{exposure_hash_rate:,.0f} H/s at '
+                f'{EXPOSURE_TIME_MS:.1f} ms/exposure'
+            )
+            yield event
+
+        for lane in range(lane_count):
+            optical_nonce = optical_nonces[lane]
+            expected_nonce = nonce + lane
+
+            if optical_nonce != expected_nonce:
+                raise RuntimeError(
+                    f'Optical nonce mismatch: lane {lane} gave '
+                    f'{optical_nonce}, expected {expected_nonce}.'
+                )
+
+            block_header = header + struct.pack(
+                '>I',
+                expected_nonce
+            )
+            digest = sha256d(block_header)
+            hashes += 1
+            zeros = leading_zero_bits(digest)
+
+            if zeros >= difficulty:
+                solution = (
+                    expected_nonce,
+                    digest,
+                    zeros,
+                )
+                break
+
+        batches += 1
+        nonce += n
+
+        exposure_hash_rate = hashes / max(
+            bench.exposure_seconds,
+            EXPOSURE_TIME_S
+        )
+
+        yield {
+            'bit': 0,
+            'width': 1,
+            'stage': (
+                f'batch {batches}, '
+                f'{hashes:,} hashes, '
+                f'{exposure_hash_rate:,.0f} H/s at '
+                f'{EXPOSURE_TIME_MS:.1f} ms/exposure, '
+                f'{bench.exposures:,} exposures'
+            ),
+        }
+
+    elapsed = max(
+        time.perf_counter() - started,
+        1e-9
+    )
+    cpu_hash_rate = hashes / elapsed
+    exposure_seconds = bench.exposure_seconds
+    exposure_hash_rate = (
+        hashes / exposure_seconds
+        if exposure_seconds > 0
+        else 0.0
+    )
+    exposures_per_hash = bench.exposures / max(1, hashes)
+
+    if solution is not None:
+        found_nonce, digest, zeros = solution
+        check_header = header + struct.pack(
+            '>I',
+            found_nonce
+        )
+        check_digest = sha256d(check_header)
+
+        if check_digest != digest:
+            raise RuntimeError(
+                'Final SHA-256 validation failed.'
+            )
+
+        if leading_zero_bits(check_digest) < difficulty:
+            raise RuntimeError(
+                'Final difficulty validation failed.'
+            )
+
+        report(f'VALID SOLUTION: nonce {found_nonce}')
+        report(f'Leading zero bits: {zeros}')
+        report(f'Digest: {digest.hex()}')
+
+        return {
+            'found': True,
+            'nonce': found_nonce,
+            'digest': digest.hex(),
+            'zeros': zeros,
+            'hashes': hashes,
+            'seconds': elapsed,
+            'cpu_hash_rate': cpu_hash_rate,
+            'exposure_seconds': exposure_seconds,
+            'exposure_hash_rate': exposure_hash_rate,
+            'exposures': bench.exposures,
+            'batches': batches,
+            'exposures_per_hash': exposures_per_hash,
+        }
+
+    report(
+        'No valid nonce found in the requested range.'
+    )
+
+    return {
+        'found': False,
+        'nonce': None,
+        'digest': None,
+        'zeros': 0,
+        'hashes': hashes,
+        'seconds': elapsed,
+        'cpu_hash_rate': cpu_hash_rate,
+        'exposure_seconds': exposure_seconds,
+        'exposure_hash_rate': exposure_hash_rate,
+        'exposures': bench.exposures,
+        'batches': batches,
+        'exposures_per_hash': exposures_per_hash,
+    }
+
+
+def cpu_pow_test(difficulty=12, max_nonce=1_000_000):
+    """Fast CPU-only diagnostic for hashing and difficulty checking."""
+    header = default_header()
+    started = time.perf_counter()
+
+    for nonce in range(max_nonce):
+        digest = sha256d(
+            header + struct.pack('>I', nonce)
+        )
+
+        if leading_zero_bits(digest) >= difficulty:
+            elapsed = time.perf_counter() - started
+
+            return {
+                'found': True,
+                'nonce': nonce,
+                'digest': digest.hex(),
+                'zeros': leading_zero_bits(digest),
+                'hashes': nonce + 1,
+                'seconds': elapsed,
+                'hash_rate': (nonce + 1) / elapsed,
+            }
+
+    elapsed = time.perf_counter() - started
+
+    return {
+        'found': False,
+        'nonce': None,
+        'digest': None,
+        'zeros': 0,
+        'hashes': max_nonce,
+        'seconds': elapsed,
+        'hash_rate': max_nonce / elapsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('IR bench SHA-256 PoW')
+        self.geometry('1280x850')
+
+        self.job = None
+        self.mode = None
+        self.bench = None
+        self.header = default_header()
+        self.difficulty = DEFAULT_DIFFICULTY
+        self.nonce_start = 0
+        self.nonce_end = 1_048_575
+        self.x_value = 0
+        self.y_value = 0
+        self.delay = 0
+
+        self.last_camera = None
+        self.display_cells = DEFAULT_CELLS
+        self.cell_labels = []
+        self.mask_window = None
+
+        self.log_lines = []
+        self.status = tk.StringVar(
+            value='Ready. Press “Run SHA-256 PoW”. '
+                  'Errors appear in the log.'
+        )
+
+        self.led_a = tk.BooleanVar(value=True)
+        self.led_b = tk.BooleanVar(value=True)
+        self.ito_enabled = tk.BooleanVar(value=True)
+
+        self._build_controls()
+        self._build_canvas()
+        self._build_log()
+
+        self.say(
+            'SHA-256 PoW: CPU validates every hash; '
+            'optical bench performs nonce arithmetic.'
+        )
+        self.say(
+            f'Timing model: {EXPOSURE_TIME_MS:.1f} ms per exposure. '
+            'Hash rate is calculated from exposure count.'
+        )
+        self.say(
+            'Default: 64 lanes, difficulty 20, '
+            'nonce 0..1,048,575.'
+        )
+        self.draw()
+
+    def _build_controls(self):
+        top = ttk.Frame(self, padding=8)
+        top.pack(fill='x')
+
+        self.vars = {
+            'cells': tk.StringVar(value=str(DEFAULT_CELLS)),
+            'difficulty': tk.StringVar(
+                value=str(DEFAULT_DIFFICULTY)
+            ),
+            'nonce_start': tk.StringVar(value='0'),
+            'nonce_end': tk.StringVar(value='1048575'),
+            'header': tk.StringVar(
+                value=default_header().hex()
+            ),
+            'exposure': tk.StringVar(value='0.22'),
+            'leak': tk.StringVar(value='0.001'),
+            'noise': tk.StringVar(value='0.002'),
+            'seed': tk.StringVar(value='1'),
+            'delay': tk.StringVar(value='0'),
+            'ambient': tk.StringVar(value='0.04'),
+            'ito_er': tk.StringVar(value='20'),
+            'ito_loss': tk.StringVar(value='8'),
+            'ito_rej': tk.StringVar(value='15'),
+            'ito_tau': tk.StringVar(value='50'),
+            'ito_settle': tk.StringVar(value='250'),
+        }
+
+        # Live update whenever the Cells field changes.
+        self.vars['cells'].trace_add(
+            'write',
+            self.on_cells_changed
+        )
+
+        fields = [
+            ('cells', 'Cells (1–1024)'),
+            ('difficulty', 'Difficulty zero bits'),
+            ('nonce_start', 'Nonce start'),
+            ('nonce_end', 'Nonce end'),
+            ('exposure', 'Exposure'),
+            ('leak', 'Leak'),
+            ('noise', 'Noise sigma'),
+            ('seed', 'Seed'),
+            ('delay', 'GUI delay ms'),
+        ]
+
+        self.entries = []
+
+        for column, (key, label) in enumerate(fields):
+            ttk.Label(
+                top,
+                text=label
+            ).grid(
+                row=0,
+                column=column,
+                padx=4,
+                sticky='w'
+            )
+
+            entry = ttk.Entry(
+                top,
+                textvariable=self.vars[key],
+                width=13
+            )
+            entry.grid(row=1, column=column, padx=4)
+            self.entries.append(entry)
+
+        header_frame = ttk.Frame(self, padding=(8, 0))
+        header_frame.pack(fill='x')
+
+        ttk.Label(
+            header_frame,
+            text=(
+                '76-byte block-header hex: version | previous hash | '
+                'merkle root | time | bits'
+            )
+        ).pack(anchor='w')
+
+        header_entry = ttk.Entry(
+            header_frame,
+            textvariable=self.vars['header']
+        )
+        header_entry.pack(fill='x')
+        self.entries.append(header_entry)
+
+        ito_frame = ttk.Frame(self, padding=(8, 4))
+        ito_frame.pack(fill='x')
+
+        ttk.Checkbutton(
+            ito_frame,
+            text='ITO plate (simulated)',
+            variable=self.ito_enabled
+        ).pack(side='left', padx=4)
+
+        ito_fields = [
+            ('ambient', 'Ambient IR'),
+            ('ito_er', 'Block ER dB'),
+            ('ito_loss', 'Open loss %'),
+            ('ito_rej', 'Ambient reject dB'),
+            ('ito_tau', 'Plate tau us'),
+            ('ito_settle', 'Settle us'),
+        ]
+
+        for key, label in ito_fields:
+            ttk.Label(
+                ito_frame,
+                text=label
+            ).pack(side='left', padx=(8, 2))
+
+            entry = ttk.Entry(
+                ito_frame,
+                textvariable=self.vars[key],
+                width=8
+            )
+            entry.pack(side='left')
+            self.entries.append(entry)
+
+        button_bar = ttk.Frame(self, padding=8)
+        button_bar.pack(fill='x')
+
+        self.buttons = []
+
+        for label, command in [
+            ('Run SHA-256 PoW', lambda: self.start('pow')),
+            ('Full-adder test', lambda: self.start('truth')),
+            ('Optical X + Y', lambda: self.start('add')),
+            ('CPU PoW test', self.run_cpu_test),
+            ('Export/show mask', self.show_mask),
+            ('Stop', self.stop),
+        ]:
+            button = ttk.Button(
+                button_bar,
+                text=label,
+                command=command
+            )
+            button.pack(side='left', padx=4)
+            self.buttons.append(button)
+
+        ttk.Checkbutton(
+            button_bar,
+            text='LED A',
+            variable=self.led_a
+        ).pack(side='left', padx=8)
+
+        ttk.Checkbutton(
+            button_bar,
+            text='LED B',
+            variable=self.led_b
+        ).pack(side='left')
+
+        ttk.Label(
+            self,
+            textvariable=self.status,
+            padding=8,
+            wraplength=1240
+        ).pack(fill='x')
+
+    def _build_canvas(self):
+        frame = ttk.Frame(self)
+        frame.pack(fill='both', expand=True, padx=8)
+
+        self.canvas = tk.Canvas(
+            frame,
+            bg='#101827',
+            highlightthickness=0
+        )
+
+        scrollbar = ttk.Scrollbar(
+            frame,
+            orient='vertical',
+            command=self.canvas.yview
+        )
+
+        self.canvas.configure(
+            yscrollcommand=scrollbar.set
+        )
+        scrollbar.pack(side='right', fill='y')
+        self.canvas.pack(
+            side='left',
+            fill='both',
+            expand=True
+        )
+        self.canvas.bind(
+            '<Configure>',
+            lambda event: self.draw()
+        )
+
+    def _build_log(self):
+        self.log = tk.Text(
+            self,
+            height=10,
+            wrap='word',
+            font=('TkFixedFont', 10)
+        )
+        self.log.pack(fill='x', padx=8, pady=8)
+        self.log.configure(state='disabled')
+
+        ttk.Label(
+            self,
+            text=(
+                'Optical bench: lane-parallel nonce addition and camera '
+                'exposures. CPU: double SHA-256, difficulty target, and '
+                'final validation. No all-optical SHA-256 claim.'
+            ),
+            padding=8
+        ).pack(fill='x')
+
+    def say(self, text):
+        self.log_lines.append(text)
+
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.insert(
+            'end',
+            '\n'.join(self.log_lines)
+        )
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def show_exception(self, title, exc):
+        text = ''.join(
+            traceback.format_exception(
+                type(exc),
+                exc,
+                exc.__traceback__
+            )
+        )
+
+        self.say(f'{title}: {exc}')
+        self.say(text)
+        self.status.set(f'{title}: {exc}')
+
+    def on_cells_changed(self, *args):
+        try:
+            cells = int(self.vars['cells'].get())
+        except ValueError:
+            return
+
+        if not 1 <= cells <= MAX_CELLS:
+            return
+
+        self.display_cells = cells
+        self.cell_labels = []
+        self.last_camera = None
+
+        self.status.set(
+            f'Cells set to {cells}. '
+            f'Next PoW run will use {cells} parallel nonce lanes.'
+        )
+        self.draw()
+
+        if (
+            self.mask_window is not None
+            and self.mask_window.winfo_exists()
+        ):
+            try:
+                image, layout, meta = make_mask(cells)
+                self.update_mask_window(
+                    cells,
+                    image,
+                    meta
+                )
+            except Exception as exc:
+                self.show_exception(
+                    'Mask preview failed',
+                    exc
+                )
+
+    def update_mask_window(self, cells, image, meta):
+        if (
+            self.mask_window is None
+            or not self.mask_window.winfo_exists()
+        ):
+            return
+
+        for child in self.mask_window.winfo_children():
+            child.destroy()
+
+        try:
+            resample = Image.Resampling.NEAREST
+        except AttributeError:
+            resample = Image.NEAREST
+
+        preview = image.convert('RGB').resize(
+            (600, 600),
+            resample
+        )
+        photo = ImageTk.PhotoImage(preview)
+
+        label = ttk.Label(
+            self.mask_window,
+            image=photo
+        )
+        label.image = photo
+        label.pack(padx=8, pady=8)
+
+        ttk.Label(
+            self.mask_window,
+            text=(
+                f'{cells} cells | '
+                f'{meta["cols"]} x {meta["rows"]} | '
+                f'aperture {meta["diameter"]:.3f} mm\n'
+                'Preview only. Use Export/show mask for PNG.'
+            ),
+            padding=8
+        ).pack()
+
+    def cell_count(self):
+        try:
+            value = int(self.vars['cells'].get())
+        except ValueError:
+            raise ValueError('Cells must be an integer.')
+
+        if not 1 <= value <= MAX_CELLS:
+            raise ValueError(
+                f'Cells must be 1..{MAX_CELLS}.'
+            )
+
+        return value
+
+    def make_bench(self):
+        cells = self.cell_count()
+
+        exposure = float(self.vars['exposure'].get())
+        leak = float(self.vars['leak'].get())
+        noise = float(self.vars['noise'].get())
+        seed = int(self.vars['seed'].get())
+        ambient = float(self.vars['ambient'].get())
+
+        if not 0 <= exposure <= 1:
+            raise ValueError('Exposure must be 0..1.')
+
+        if not 0 <= leak < 0.5:
+            raise ValueError('Leak must be 0..<0.5.')
+
+        if not 0 <= noise <= 1:
+            raise ValueError(
+                'Noise sigma must be 0..1.'
+            )
+
+        if not 0 <= ambient <= 0.5:
+            raise ValueError(
+                'Ambient IR must be 0..0.5.'
+            )
+
+        ito = ITOPlate(
+            enabled=self.ito_enabled.get(),
+            extinction_db=float(self.vars['ito_er'].get()),
+            loss=float(self.vars['ito_loss'].get()) / 100,
+            reject_db=float(self.vars['ito_rej'].get()),
+            tau_us=float(self.vars['ito_tau'].get()),
+            settle_us=float(self.vars['ito_settle'].get()),
+        )
+
+        return CameraBench(
+            cells=cells,
+            exposure=exposure,
+            leak=leak,
+            noise=noise,
+            seed=seed,
+            led_a=self.led_a.get(),
+            led_b=self.led_b.get(),
+            ito=ito,
+            ambient=ambient,
+        )
+
+    def start(self, mode):
+        if self.job is not None:
+            return
+
+        try:
+            self.mode = mode
+            self.bench = self.make_bench()
+            self.display_cells = self.bench.cells
+            self.last_camera = None
+            self.cell_labels = []
+            self.delay = int(self.vars['delay'].get())
+
+            if mode == 'pow':
+                self.difficulty = int(
+                    self.vars['difficulty'].get()
+                )
+                self.nonce_start = int(
+                    self.vars['nonce_start'].get()
+                )
+                self.nonce_end = int(
+                    self.vars['nonce_end'].get()
+                )
+                self.header = parse_header_hex(
+                    self.vars['header'].get()
+                )
+
+                if not 1 <= self.difficulty <= MAX_DIFFICULTY:
+                    raise ValueError(
+                        f'Difficulty must be '
+                        f'1..{MAX_DIFFICULTY}.'
+                    )
+
+                self.job = pow_job(
+                    self.bench,
+                    self.header,
+                    self.nonce_start,
+                    self.nonce_end,
+                    self.difficulty,
+                    self.say,
+                )
+
+            elif mode == 'truth':
+                self.job = self.truth_job()
+
+            elif mode == 'add':
+                self.x_value = int(
+                    self.vars['nonce_start'].get()
+                )
+                self.y_value = int(
+                    self.vars['nonce_end'].get()
+                )
+
+                if self.x_value < 0 or self.y_value < 0:
+                    raise ValueError(
+                        'X and Y must be non-negative.'
+                    )
+
+                width = (
+                    self.x_value + self.y_value
+                ).bit_length() + 1
+
+                self.job = optical_add(
+                    self.bench,
+                    [self.x_value] * self.bench.cells,
+                    [self.y_value] * self.bench.cells,
+                    width,
+                )
+
+            self.set_ui_running(True)
+            self.status.set(f'{mode} running...')
+            self.after(1, self.tick)
+
+        except Exception as exc:
+            self.job = None
+            self.set_ui_running(False)
+            self.show_exception(
+                'Could not start',
+                exc
+            )
+
+    def truth_job(self):
+        n = self.bench.cells
+        tested = 0
+
+        for start in range(0, 8, n):
+            ids = list(range(start, min(8, start + n)))
+            inputs = []
+
+            for value in ids:
+                inputs.append((
+                    (value >> 2) & 1,
+                    (value >> 1) & 1,
+                    value & 1,
+                ))
+
+            inputs += [(0, 0, 0)] * (n - len(ids))
+            active = [
+                i < len(ids)
+                for i in range(n)
+            ]
+
+            decoded = self.bench.capture(
+                inputs,
+                active
+            )
+
+            yield {
+                'bit': 0,
+                'width': 1,
+                'stage': 'full-adder truth test',
+            }
+
+            for lane, value in enumerate(ids):
+                expected = (
+                    ((value >> 2) & 1)
+                    + ((value >> 1) & 1)
+                    + (value & 1)
+                )
+
+                if decoded[lane]['k'] != expected:
+                    raise RuntimeError(
+                        f'Truth-table failure for '
+                        f'{inputs[lane]}.'
+                    )
+
+                tested += 1
+
+        return (
+            f'All {tested} full-adder combinations passed.'
+        )
+
+    def run_cpu_test(self):
+        try:
+            result = cpu_pow_test(
+                difficulty=12,
+                max_nonce=1_000_000
+            )
+
+            if result['found']:
+                self.say(
+                    f'CPU test VALID: nonce {result["nonce"]}, '
+                    f'{result["zeros"]} leading zero bits.'
+                )
+                self.say(
+                    f'Digest: {result["digest"]}'
+                )
+            else:
+                self.say(
+                    'CPU test: no nonce found in diagnostic range.'
+                )
+
+            self.say(
+                f'CPU test: {result["hashes"]:,} hashes in '
+                f'{result["seconds"]:.3f} s = '
+                f'{result["hash_rate"]:,.0f} H/s.'
+            )
+            self.status.set('CPU PoW test complete.')
+
+        except Exception as exc:
+            self.show_exception(
+                'CPU PoW test failed',
+                exc
+            )
+
+    def tick(self):
+        if self.job is None:
+            return
+
+        try:
+            event = next(self.job)
+            self.last_camera = self.bench.last
+
+            if 'stage' in event:
+                self.cell_labels = [
+                    event['stage']
+                ] * self.bench.cells
+
+            self.status.set(
+                f'{self.mode}: {self.bench.cells} cells | '
+                f'exposures {self.bench.exposures:,} | '
+                f'{self.bench.exposure_seconds:.3f} s at '
+                f'{EXPOSURE_TIME_MS:.1f} ms/exposure | '
+                f'bit {event["bit"] + 1}/{event["width"]} | '
+                f'margin {self.bench.worst_margin:.2f} | '
+                f'{event.get("stage", "")}'
+            )
+            self.draw()
+            self.after(self.delay, self.tick)
+
+        except StopIteration as stop:
+            result = stop.value
+            self.finish_job()
+
+            if self.mode == 'pow':
+                if result['found']:
+                    message = (
+                        f'VALID PoW: nonce {result["nonce"]}, '
+                        f'{result["zeros"]} leading zero bits.'
+                    )
+                    self.say(
+                        f'Digest: {result["digest"]}'
+                    )
+                else:
+                    message = (
+                        'No valid nonce found in range.'
+                    )
+
+                message += (
+                    f' | {result["hashes"]:,} SHA-256 hashes | '
+                    f'{result["exposure_hash_rate"]:,.0f} H/s '
+                    f'at {EXPOSURE_TIME_MS:.1f} ms/exposure | '
+                    f'{result["exposures"]:,} optical exposures | '
+                    f'{result["exposure_seconds"]:.3f} s '
+                    f'exposure time | '
+                    f'{result["exposures_per_hash"]:.3f} '
+                    f'exposures/hash.'
+                )
+
+                self.say(message)
+                self.status.set(message)
+
+            elif self.mode == 'add':
+                counts = {}
+
+                for value in result:
+                    counts[value] = counts.get(value, 0) + 1
+
+                most_common = max(
+                    counts.items(),
+                    key=lambda item: item[1]
+                )
+
+                message = (
+                    f'Optical sum: {self.x_value} + '
+                    f'{self.y_value} = {most_common[0]} '
+                    f'({most_common[1]}/{len(result)} lanes agree).'
+                )
+
+                self.say(message)
+                self.status.set(message)
+
+            elif self.mode == 'truth':
+                self.say(str(result))
+                self.status.set(str(result))
+
+            self.show_mask(self.bench.cells)
+
+        except Exception as exc:
+            self.job = None
+            self.set_ui_running(False)
+            self.show_exception(
+                'PoW/bench stopped',
+                exc
+            )
+
+    def finish_job(self):
+        self.job = None
+        self.set_ui_running(False)
+
+    def set_ui_running(self, running):
+        state = 'disabled' if running else 'normal'
+
+        for entry in self.entries:
+            entry.configure(state=state)
+
+        for button in self.buttons:
+            button.configure(state=state)
+
+    def stop(self):
+        if self.job is not None:
+            self.job.close()
+            self.finish_job()
+            self.status.set('Stopped.')
+            self.say(
+                'Stopped by user. No completed-run result.'
+            )
+
+    def show_mask(self, cells=None):
+        try:
+            if cells is None:
+                cells = self.cell_count()
+
+            path, image, meta = export_mask(
+                Path(__file__).resolve().parent / 'mask',
+                cells
+            )
+
+            self.say(
+                f'Mask exported: {cells} cells, aperture '
+                f'{meta["diameter"]:.3f} mm, {path}'
+            )
+
+            if (
+                self.mask_window is not None
+                and self.mask_window.winfo_exists()
+            ):
+                self.mask_window.destroy()
+
+            self.mask_window = tk.Toplevel(self)
+            self.mask_window.title(
+                '20 x 20 mm physical mask'
+            )
+
+            self.update_mask_window(
+                cells,
+                image,
+                meta
+            )
+
+        except Exception as exc:
+            self.show_exception(
+                'Mask export failed',
+                exc
+            )
+
+    def draw(self):
+        canvas = self.canvas
+        canvas.delete('all')
+
+        width = max(450, canvas.winfo_width())
+        cells = self.display_cells
+        columns = min(
+            cells,
+            max(1, int(width / 260))
+        )
+        rows = math.ceil(cells / columns)
+        cell_width = (width - 24) / columns
+        cell_height = 150
+
+        canvas.configure(
+            scrollregion=(
+                0,
+                0,
+                width,
+                rows * cell_height + 40
+            )
+        )
+
+        for i in range(cells):
+            x = 12 + (i % columns) * cell_width
+            y = 12 + (i // columns) * cell_height
+
+            canvas.create_rectangle(
+                x,
+                y,
+                x + cell_width - 10,
+                y + cell_height - 10,
+                fill='#182338',
+                outline='#475569'
+            )
+
+            title = f'Cell {i + 1}'
+
+            if (
+                i < len(self.cell_labels)
+                and self.cell_labels[i]
+            ):
+                title += f'  {self.cell_labels[i]}'
+
+            canvas.create_text(
+                x + 12,
+                y + 18,
+                text=title,
+                fill='white',
+                anchor='w'
+            )
+
+            data = self.last_camera
+
+            if data and i < len(data['rows']):
+                row = data['rows'][i]
+                decoded = data['decoded'][i]
+
+                for j, (label, key) in enumerate([
+                    ('signal', 'signal'),
+                    ('ref A', 'refa'),
+                    ('ref B', 'refb'),
+                ]):
+                    yy = y + 45 + j * 22
+
+                    canvas.create_text(
+                        x + 12,
+                        yy,
+                        text=label,
+                        fill='#94a3b8',
+                        anchor='w'
+                    )
+
+                    left = x + 70
+                    right = x + cell_width - 58
+
+                    canvas.create_rectangle(
+                        left,
+                        yy - 5,
+                        right,
+                        yy + 5,
+                        fill='#080d19',
+                        outline=''
+                    )
+
+                    canvas.create_rectangle(
+                        left,
+                        yy - 5,
+                        left + (right - left) * row[key],
+                        yy + 5,
+                        fill='#34d399',
+                        outline=''
+                    )
+
+                    canvas.create_text(
+                        right + 4,
+                        yy,
+                        text=f'{row[key]:.2f}',
+                        fill='white',
+                        anchor='w'
+                    )
+
+                canvas.create_text(
+                    x + 12,
+                    y + 125,
+                    text=(
+                        f'Level {decoded["level"]:.2f} -> '
+                        f'sum {decoded["sum"]} '
+                        f'carry {decoded["carry"]}'
+                    ),
+                    fill='#67e8f9',
+                    anchor='w'
+                )
+
+            else:
+                canvas.create_text(
+                    x + 12,
+                    y + 80,
+                    text='Ready for exposure',
+                    fill='#94a3b8',
+                    anchor='w'
+                )
+
+
+def main():
+    try:
+        app = App()
+        app.mainloop()
+    except Exception:
+        traceback.print_exc()
+        input('\nPress Enter to close...')
+
+
+if __name__ == '__main__':
+    main()
