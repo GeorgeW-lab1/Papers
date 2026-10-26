@@ -14,9 +14,16 @@ This implements the kHeavyHash construction used by Kaspa:
 The IR bench performs lane-parallel nonce arithmetic and simulated camera
 exposures. The CPU computes and validates every kHeavyHash hash.
 
+Efficiency changes in this version:
+    * The 64x64 matrix is generated once per job and reused for every hash.
+    * Lane index supplies the low nonce bits; only a shared counter is
+      incremented optically (one active cell, ripple stops when the carry
+      dies), so a batch costs about 2 exposures regardless of lane count.
+      Cells must be a power of two in PoW mode.
+
 Timing model:
-    Every optical exposure is assumed to take 1 ms.
-    Reported bench hash rate = valid hashes / (exposures * 0.001 s).
+    Every optical exposure is assumed to take 100 ns.
+    Reported bench hash rate = valid hashes / (exposures * 100 ns).
 
 Run:
     python -m pip install pillow pycryptodome
@@ -52,7 +59,7 @@ DEFAULT_DIFFICULTY = 5
 MAX_DIFFICULTY = 32
 MAX_HASHES = 20_000_000
 
-EXPOSURE_TIME_MS = 0.0001
+EXPOSURE_TIME_MS = 0.0001  # 100 ns per exposure
 EXPOSURE_TIME_S = EXPOSURE_TIME_MS / 1000.0
 
 DPI = 2540
@@ -63,6 +70,8 @@ SHOT_K = 0.06
 
 PROOF_OF_WORK_DOMAIN = b'ProofOfWorkHash'
 HEAVY_HASH_DOMAIN = b'HeavyHash'
+
+MASK64 = 0xFFFFFFFFFFFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +84,8 @@ def cshake256(data, domain):
 
 
 def rotl64(value, amount):
-    value &= 0xFFFFFFFFFFFFFFFF
-    return ((value << amount) | (value >> (64 - amount))) & 0xFFFFFFFFFFFFFFFF
+    value &= MASK64
+    return ((value << amount) | (value >> (64 - amount))) & MASK64
 
 
 class Xoshiro256PlusPlus:
@@ -92,13 +101,10 @@ class Xoshiro256PlusPlus:
         self.s3 = struct.unpack('<Q', seed32[24:32])[0]
 
     def next_u64(self):
-        result = rotl64(
-            (self.s0 + self.s3) & 0xFFFFFFFFFFFFFFFF,
-            23
-        )
-        result = (result + self.s0) & 0xFFFFFFFFFFFFFFFF
+        result = rotl64((self.s0 + self.s3) & MASK64, 23)
+        result = (result + self.s0) & MASK64
 
-        t = (self.s1 << 17) & 0xFFFFFFFFFFFFFFFF
+        t = (self.s1 << 17) & MASK64
 
         self.s2 ^= self.s0
         self.s3 ^= self.s1
@@ -154,9 +160,7 @@ def generate_matrix(pre_pow_hash):
             for j in range(0, 64, 16):
                 value = generator.next_u64()
                 for shift in range(16):
-                    matrix[i][j + shift] = (
-                        (value >> (4 * shift)) & 0x0F
-                    )
+                    matrix[i][j + shift] = (value >> (4 * shift)) & 0x0F
 
         if matrix_rank_reference(matrix) == 64:
             return matrix
@@ -176,24 +180,31 @@ def kheavyhash_from_pow_hash(pow_hash, matrix):
     product = [0] * 64
 
     for i in range(64):
-        total = 0
-
-        for j in range(64):
-            total += matrix[i][j] * vector[j]
+        row = matrix[i]
+        total = sum(row[j] * vector[j] for j in range(64))
 
         # Match uint16 arithmetic in the reference implementation.
-        total &= 0xFFFF
-        product[i] = total >> 10
+        product[i] = (total & 0xFFFF) >> 10
 
     transformed = bytearray(32)
 
     for i in range(32):
-        mixed_byte = (
-            (product[2 * i] << 4) | product[2 * i + 1]
-        ) & 0xFF
+        mixed_byte = ((product[2 * i] << 4) | product[2 * i + 1]) & 0xFF
         transformed[i] = pow_hash[i] ^ mixed_byte
 
     return cshake256(bytes(transformed), HEAVY_HASH_DOMAIN)
+
+
+def kheavyhash_cached(work_order, matrix):
+    """kHeavyHash with a precomputed matrix (constant per job)."""
+    if len(work_order) != 80:
+        raise ValueError(
+            f'kHeavyHash work order must be exactly 80 bytes, '
+            f'not {len(work_order)}.'
+        )
+
+    pow_hash = cshake256(work_order, PROOF_OF_WORK_DOMAIN)
+    return kheavyhash_from_pow_hash(pow_hash, matrix)
 
 
 def kheavyhash(work_order):
@@ -204,13 +215,8 @@ def kheavyhash(work_order):
             f'not {len(work_order)}.'
         )
 
-    pow_hash = cshake256(
-        work_order,
-        PROOF_OF_WORK_DOMAIN
-    )
     matrix = generate_matrix(work_order[0:32])
-
-    return kheavyhash_from_pow_hash(pow_hash, matrix)
+    return kheavyhash_cached(work_order, matrix)
 
 
 def leading_zero_bits(digest):
@@ -307,14 +313,8 @@ class CameraBench:
         self.ambient = ambient
         self.xtalk = xtalk
 
-        self.itx = [
-            [self.ito.p_off] * 5
-            for _ in range(cells)
-        ]
-        self.pbits = [
-            [0] * 5
-            for _ in range(cells)
-        ]
+        self.itx = [[self.ito.p_off] * 5 for _ in range(cells)]
+        self.pbits = [[0] * 5 for _ in range(cells)]
 
         self.exposures = 0
         self.last = None
@@ -337,32 +337,24 @@ class CameraBench:
         n = self.cells
 
         if len(inputs) != n:
-            raise ValueError(
-                f'Exactly {n} input lanes are required.'
-            )
+            raise ValueError(f'Exactly {n} input lanes are required.')
 
         act = [True] * n if active is None else list(active)
 
         if len(act) != n:
-            raise ValueError(
-                f'Exactly {n} active flags are required.'
-            )
+            raise ValueError(f'Exactly {n} active flags are required.')
 
         use_ito = self.ito.enabled
         ambient = self.ambient * (
             self.ito.ambient_factor if use_ito else 1.0
         )
         dark = 0.01 + ambient
-        noise_sigma = math.sqrt(
-            self.noise ** 2 + SHOT_K ** 2 * ambient
-        )
+        noise_sigma = math.sqrt(self.noise ** 2 + SHOT_K ** 2 * ambient)
         exposure = self.exposure
         lit = sum(act) if use_ito else n
         stray = self.xtalk * exposure * lit / n
         p_on = self.ito.p_on if use_ito else 1.0
-        closed = self.leak * (
-            self.ito.p_off if use_ito else 1.0
-        )
+        closed = self.leak * (self.ito.p_off if use_ito else 1.0)
         lambda_closed = closed / p_on
         led_a = float(self.led_a)
         led_b = float(self.led_b)
@@ -373,10 +365,7 @@ class CameraBench:
         def pixel(value):
             return max(
                 0.0,
-                min(
-                    1.0,
-                    value + self.rng.gauss(0, noise_sigma)
-                )
+                min(1.0, value + self.rng.gauss(0, noise_sigma))
             )
 
         rows = []
@@ -384,16 +373,12 @@ class CameraBench:
 
         for i, (a, b, carry) in enumerate(inputs):
             if a not in (0, 1) or b not in (0, 1) or carry not in (0, 1):
-                raise ValueError(
-                    'Optical inputs must be binary.'
-                )
+                raise ValueError('Optical inputs must be binary.')
 
             if use_ito:
                 idle = not act[i]
                 target_bits = (
-                    (0, 0, 0, 0, 0)
-                    if idle
-                    else (a, b, carry, 1, 1)
+                    (0, 0, 0, 0, 0) if idle else (a, b, carry, 1, 1)
                 )
 
                 if list(target_bits) != self.pbits[i]:
@@ -454,14 +439,10 @@ class CameraBench:
             ref_b = row['refb'] - row['black']
 
             if min(ref_a, ref_b) < 0.04:
-                raise RuntimeError(
-                    'Insufficient LED reference signal.'
-                )
+                raise RuntimeError('Insufficient LED reference signal.')
 
             if abs(ref_a - ref_b) > 0.25 * max(ref_a, ref_b):
-                raise RuntimeError(
-                    'Unequal LED references.'
-                )
+                raise RuntimeError('Unequal LED references.')
 
             level = (
                 row['signal'] - row['baseline']
@@ -470,10 +451,7 @@ class CameraBench:
             )
             k = round(level)
 
-            self.worst_margin = max(
-                self.worst_margin,
-                abs(level - k)
-            )
+            self.worst_margin = max(self.worst_margin, abs(level - k))
             self.err_sq += (level - k) ** 2
             self.err_n += 1
 
@@ -503,34 +481,26 @@ class CameraBench:
         return decoded
 
 
-def optical_add(
-    bench,
-    x_values,
-    y_values,
-    width,
-    active=None,
-):
+def optical_add(bench, x_values, y_values, width, active=None):
     """Lane-parallel optical addition."""
     n = bench.cells
 
     if len(x_values) != n or len(y_values) != n:
-        raise ValueError(
-            f'optical_add requires exactly {n} lanes.'
-        )
+        raise ValueError(f'optical_add requires exactly {n} lanes.')
 
     carry = [0] * n
     result = [0] * n
     act = [True] * n if active is None else list(active)
 
     for bit in range(width):
-        inputs = []
-
-        for i in range(n):
-            inputs.append((
+        inputs = [
+            (
                 (x_values[i] >> bit) & 1,
                 (y_values[i] >> bit) & 1,
                 carry[i],
-            ))
+            )
+            for i in range(n)
+        ]
 
         decoded = bench.capture(inputs, act)
 
@@ -541,13 +511,46 @@ def optical_add(
         yield {
             'bit': bit,
             'width': width,
-            'stage': (
-                f'optical nonce add bit {bit + 1}/{width}'
-            ),
+            'stage': f'optical nonce add bit {bit + 1}/{width}',
         }
 
     if any(carry):
         raise RuntimeError('Optical addition overflow.')
+
+    return result
+
+
+def optical_increment(bench, value, width):
+    """Optical +1 on a shared counter using one active cell.
+
+    Computes value + 1 as a ripple of full adders with b = 0 and carry-in = 1.
+    The ripple stops as soon as the carry dies, so the cost is
+    (trailing 1-bits + 1) exposures, about 2 on average.
+    """
+    n = bench.cells
+    act = [True] + [False] * (n - 1)
+    result = 0
+    carry = 1
+
+    for bit in range(width):
+        if not carry:
+            result |= (value >> bit) << bit
+            break
+
+        a = (value >> bit) & 1
+        decoded = bench.capture([(a, 0, carry)] * n, act)
+        d = decoded[0]
+        result |= d['sum'] << bit
+        carry = d['carry']
+
+        yield {
+            'bit': bit,
+            'width': width,
+            'stage': f'optical counter increment bit {bit + 1}',
+        }
+
+    if carry:
+        raise RuntimeError('Optical counter overflow.')
 
     return result
 
@@ -567,8 +570,10 @@ def pow_job(
 ):
     """Kaspa-style kHeavyHash PoW.
 
-    The optical bench generates and verifies lane-parallel nonce candidates.
-    The CPU computes the exact kHeavyHash digest for every candidate.
+    The optical bench increments the shared batch counter; lane i tests
+    nonce (counter << w) | i.
+    The CPU computes the exact kHeavyHash digest for every candidate using a
+    matrix generated once for the whole job.
     """
     n = bench.cells
     total = end_nonce - start_nonce + 1
@@ -577,10 +582,8 @@ def pow_job(
     if len(pre_pow_hash) != 32:
         raise ValueError('Pre-PoW hash must be 32 bytes.')
 
-    if start_nonce < 0 or end_nonce > 0xFFFFFFFFFFFFFFFF:
-        raise ValueError(
-            'Nonce values must fit in 64 bits.'
-        )
+    if start_nonce < 0 or end_nonce > MASK64:
+        raise ValueError('Nonce values must fit in 64 bits.')
 
     if end_nonce < start_nonce:
         raise ValueError(
@@ -589,15 +592,24 @@ def pow_job(
 
     if total > MAX_HASHES:
         raise ValueError(
-            f'Nonce range too large: '
-            f'{total:,} > {MAX_HASHES:,}.'
+            f'Nonce range too large: {total:,} > {MAX_HASHES:,}.'
         )
 
     if expected > MAX_HASHES:
         raise ValueError(
-            f'Difficulty too high: expected about '
-            f'{expected:,} hashes.'
+            f'Difficulty too high: expected about {expected:,} hashes.'
         )
+
+    # Lane i always tests nonce (counter << w) | i. Only the shared counter
+    # changes between batches, and it is incremented optically.
+    if n & (n - 1):
+        raise ValueError(
+            'Cells must be a power of two for PoW mode '
+            '(lane index = low nonce bits).'
+        )
+
+    w = n.bit_length() - 1
+    counter_width = 64 - w
 
     report(
         f'kHeavyHash PoW started: {n} lanes, difficulty {difficulty}, '
@@ -605,87 +617,50 @@ def pow_job(
         f'{total:,} candidates, expected about {expected:,} hashes.'
     )
     report(
-        f'Timing model: {EXPOSURE_TIME_MS:.1f} ms per optical exposure. '
-        'Bench hash rate = hashes / (exposures * 0.001 s).'
+        f'Timing model: {EXPOSURE_TIME_MS:.12f} ms per optical exposure. '
+        'Bench hash rate = hashes / (exposures * exposure time).'
     )
     report(
-        'CPU computes exact kHeavyHash; optics performs lane '
-        'nonce addition and exposures.'
+        f'Lane index fixes the low {w} nonce bits; the shared '
+        f'{counter_width}-bit counter is incremented optically '
+        '(about 2 exposures per batch).'
+    )
+    report(
+        'CPU computes exact kHeavyHash; optics performs the counter '
+        'increment and exposures.'
     )
 
     matrix = generate_matrix(pre_pow_hash)
-    report('Generated full-rank 64 x 64 kHeavyHash matrix.')
+    report('Generated full-rank 64 x 64 kHeavyHash matrix (cached).')
 
     started = time.perf_counter()
     hashes = 0
     batches = 0
     solution = None
-    nonce = start_nonce
+    counter = start_nonce >> w
+    last_counter = end_nonce >> w
 
-    while nonce <= end_nonce and solution is None:
-        lane_count = min(n, end_nonce - nonce + 1)
-        active = [i < lane_count for i in range(n)]
-        base = [nonce] * n
-        offsets = list(range(n))
+    while True:
+        base = counter << w
+        lane_count = 0
 
-        adder = optical_add(
-            bench,
-            base,
-            offsets,
-            64,
-            active,
-        )
+        for lane in range(n):
+            nonce = base | lane
 
-        while True:
-            try:
-                event = next(adder)
-            except StopIteration as stop:
-                optical_nonces = stop.value
-                break
+            if nonce < start_nonce or nonce > end_nonce:
+                continue
 
-            exposure_hash_rate = hashes / max(
-                bench.exposure_seconds,
-                EXPOSURE_TIME_S
-            )
-
-            event['stage'] = (
-                f'batch {batches + 1}, '
-                f'lanes {lane_count}, '
-                f'base nonce {nonce:,}, '
-                f'{exposure_hash_rate:,.0f} H/s at '
-                f'{EXPOSURE_TIME_MS:.1f} ms/exposure'
-            )
-            yield event
-
-        for lane in range(lane_count):
-            optical_nonce = optical_nonces[lane]
-            expected_nonce = nonce + lane
-
-            if optical_nonce != expected_nonce:
-                raise RuntimeError(
-                    f'Optical nonce mismatch: lane {lane} gave '
-                    f'{optical_nonce}, expected {expected_nonce}.'
-                )
-
-            work_order = make_work_order(
-                pre_pow_hash,
-                timestamp,
-                expected_nonce,
-            )
-            digest = kheavyhash(work_order)
+            lane_count += 1
+            work_order = make_work_order(pre_pow_hash, timestamp, nonce)
+            digest = kheavyhash_cached(work_order, matrix)
             hashes += 1
             zeros = leading_zero_bits(digest)
 
             if zeros >= difficulty:
-                solution = (
-                    expected_nonce,
-                    digest,
-                    zeros,
-                )
+                solution = (nonce, digest, zeros)
                 break
 
         batches += 1
-        nonce += n
 
         exposure_hash_rate = hashes / max(
             bench.exposure_seconds,
@@ -697,70 +672,50 @@ def pow_job(
             'width': 1,
             'stage': (
                 f'batch {batches}, '
+                f'lanes {lane_count}, '
                 f'{hashes:,} hashes, '
                 f'{exposure_hash_rate:,.0f} H/s at '
-                f'{EXPOSURE_TIME_MS:.1f} ms/exposure, '
+                f'{EXPOSURE_TIME_MS:.12f} ms/exposure, '
                 f'{bench.exposures:,} exposures'
             ),
         }
 
-    elapsed = max(
-        time.perf_counter() - started,
-        1e-9
-    )
+        if solution is not None or counter >= last_counter:
+            break
+
+        incrementer = optical_increment(bench, counter, counter_width)
+
+        while True:
+            try:
+                event = next(incrementer)
+            except StopIteration as stop:
+                new_counter = stop.value
+                break
+
+            event['stage'] = (
+                f'batch {batches}, counter {counter:,}, '
+                f'{exposure_hash_rate:,.0f} H/s at '
+                f'{EXPOSURE_TIME_MS:.12f} ms/exposure'
+            )
+            yield event
+
+        if new_counter != counter + 1:
+            raise RuntimeError(
+                f'Optical counter mismatch: got {new_counter}, '
+                f'expected {counter + 1}.'
+            )
+
+        counter = new_counter
+
+    elapsed = max(time.perf_counter() - started, 1e-9)
     cpu_hash_rate = hashes / elapsed
     exposure_seconds = bench.exposure_seconds
     exposure_hash_rate = (
-        hashes / exposure_seconds
-        if exposure_seconds > 0
-        else 0.0
+        hashes / exposure_seconds if exposure_seconds > 0 else 0.0
     )
     exposures_per_hash = bench.exposures / max(1, hashes)
 
-    if solution is not None:
-        found_nonce, digest, zeros = solution
-
-        check_work = make_work_order(
-            pre_pow_hash,
-            timestamp,
-            found_nonce,
-        )
-        check_digest = kheavyhash(check_work)
-
-        if check_digest != digest:
-            raise RuntimeError(
-                'Final kHeavyHash validation failed.'
-            )
-
-        if leading_zero_bits(check_digest) < difficulty:
-            raise RuntimeError(
-                'Final difficulty validation failed.'
-            )
-
-        report(f'VALID SOLUTION: nonce {found_nonce}')
-        report(f'Leading zero bits: {zeros}')
-        report(f'kHeavyHash digest: {digest.hex()}')
-
-        return {
-            'found': True,
-            'nonce': found_nonce,
-            'digest': digest.hex(),
-            'zeros': zeros,
-            'hashes': hashes,
-            'seconds': elapsed,
-            'cpu_hash_rate': cpu_hash_rate,
-            'exposure_seconds': exposure_seconds,
-            'exposure_hash_rate': exposure_hash_rate,
-            'exposures': bench.exposures,
-            'batches': batches,
-            'exposures_per_hash': exposures_per_hash,
-        }
-
-    report(
-        'No valid nonce found in the requested range.'
-    )
-
-    return {
+    result = {
         'found': False,
         'nonce': None,
         'digest': None,
@@ -775,22 +730,44 @@ def pow_job(
         'exposures_per_hash': exposures_per_hash,
     }
 
+    if solution is not None:
+        found_nonce, digest, zeros = solution
+
+        check_work = make_work_order(pre_pow_hash, timestamp, found_nonce)
+        check_digest = kheavyhash_cached(check_work, matrix)
+
+        if check_digest != digest:
+            raise RuntimeError('Final kHeavyHash validation failed.')
+
+        if leading_zero_bits(check_digest) < difficulty:
+            raise RuntimeError('Final difficulty validation failed.')
+
+        report(f'VALID SOLUTION: nonce {found_nonce}')
+        report(f'Leading zero bits: {zeros}')
+        report(f'kHeavyHash digest: {digest.hex()}')
+
+        result.update({
+            'found': True,
+            'nonce': found_nonce,
+            'digest': digest.hex(),
+            'zeros': zeros,
+        })
+        return result
+
+    report('No valid nonce found in the requested range.')
+    return result
+
 
 def cpu_pow_test(difficulty=12, max_nonce=100_000):
-    """Fast CPU-only kHeavyHash diagnostic."""
-    pre_pow_hash = bytes.fromhex(
-        '11' * 32
-    )
+    """Fast CPU-only kHeavyHash diagnostic (matrix generated once)."""
+    pre_pow_hash = bytes.fromhex('11' * 32)
     timestamp = int(time.time())
+    matrix = generate_matrix(pre_pow_hash)
     started = time.perf_counter()
 
     for nonce in range(max_nonce):
-        work_order = make_work_order(
-            pre_pow_hash,
-            timestamp,
-            nonce,
-        )
-        digest = kheavyhash(work_order)
+        work_order = make_work_order(pre_pow_hash, timestamp, nonce)
+        digest = kheavyhash_cached(work_order, matrix)
 
         if leading_zero_bits(digest) >= difficulty:
             elapsed = time.perf_counter() - started
@@ -805,7 +782,7 @@ def cpu_pow_test(difficulty=12, max_nonce=100_000):
                 'hash_rate': (nonce + 1) / elapsed,
             }
 
-    elapsed = time.perf_counter() - started
+    elapsed = max(time.perf_counter() - started, 1e-9)
 
     return {
         'found': False,
@@ -864,9 +841,7 @@ def make_mask(cells):
                 (x - radius, y - radius, x + radius, y + radius),
                 fill=1
             )
-            layout.append(
-                (i + 1, label, cx + ox, cy + oy, diameter)
-            )
+            layout.append((i + 1, label, cx + ox, cy + oy, diameter))
 
     for x, y in [(1, 1), (19, 1), (1, 19), (19, 19)]:
         x = mm(x)
@@ -971,12 +946,12 @@ class App(tk.Tk):
             'XOR -> cSHAKE256.'
         )
         self.say(
-            f'Timing model: {EXPOSURE_TIME_MS:.1f} ms per exposure. '
+            f'Timing model: {EXPOSURE_TIME_MS:.12f} ms per exposure. '
             'Hash rate is calculated from exposure count.'
         )
         self.say(
-            'Default: 64 lanes, difficulty 20, '
-            'nonce 0..1,048,575.'
+            f'Default: {DEFAULT_CELLS} lanes, difficulty '
+            f'{DEFAULT_DIFFICULTY}, nonce 0..1,048,575.'
         )
         self.draw()
 
@@ -986,17 +961,11 @@ class App(tk.Tk):
 
         self.vars = {
             'cells': tk.StringVar(value=str(DEFAULT_CELLS)),
-            'difficulty': tk.StringVar(
-                value=str(DEFAULT_DIFFICULTY)
-            ),
+            'difficulty': tk.StringVar(value=str(DEFAULT_DIFFICULTY)),
             'nonce_start': tk.StringVar(value='0'),
             'nonce_end': tk.StringVar(value='1048575'),
-            'pre_pow_hash': tk.StringVar(
-                value=('11' * 32)
-            ),
-            'timestamp': tk.StringVar(
-                value=str(int(time.time()))
-            ),
+            'pre_pow_hash': tk.StringVar(value='11' * 32),
+            'timestamp': tk.StringVar(value=str(int(time.time()))),
             'exposure': tk.StringVar(value='0.22'),
             'leak': tk.StringVar(value='0.001'),
             'noise': tk.StringVar(value='0.002'),
@@ -1010,10 +979,7 @@ class App(tk.Tk):
             'ito_settle': tk.StringVar(value='250'),
         }
 
-        self.vars['cells'].trace_add(
-            'write',
-            self.on_cells_changed
-        )
+        self.vars['cells'].trace_add('write', self.on_cells_changed)
 
         fields = [
             ('cells', 'Cells (1–1024)'),
@@ -1031,14 +997,8 @@ class App(tk.Tk):
         self.entries = []
 
         for column, (key, label) in enumerate(fields):
-            ttk.Label(
-                top,
-                text=label
-            ).grid(
-                row=0,
-                column=column,
-                padx=4,
-                sticky='w'
+            ttk.Label(top, text=label).grid(
+                row=0, column=column, padx=4, sticky='w'
             )
 
             entry = ttk.Entry(
@@ -1083,10 +1043,7 @@ class App(tk.Tk):
         ]
 
         for key, label in ito_fields:
-            ttk.Label(
-                ito_frame,
-                text=label
-            ).pack(side='left', padx=(8, 2))
+            ttk.Label(ito_frame, text=label).pack(side='left', padx=(8, 2))
 
             entry = ttk.Entry(
                 ito_frame,
@@ -1109,11 +1066,7 @@ class App(tk.Tk):
             ('Export/show mask', self.show_mask),
             ('Stop', self.stop),
         ]:
-            button = ttk.Button(
-                button_bar,
-                text=label,
-                command=command
-            )
+            button = ttk.Button(button_bar, text=label, command=command)
             button.pack(side='left', padx=4)
             self.buttons.append(button)
 
@@ -1152,19 +1105,10 @@ class App(tk.Tk):
             command=self.canvas.yview
         )
 
-        self.canvas.configure(
-            yscrollcommand=scrollbar.set
-        )
+        self.canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
-        self.canvas.pack(
-            side='left',
-            fill='both',
-            expand=True
-        )
-        self.canvas.bind(
-            '<Configure>',
-            lambda event: self.draw()
-        )
+        self.canvas.pack(side='left', fill='both', expand=True)
+        self.canvas.bind('<Configure>', lambda event: self.draw())
 
     def _build_log(self):
         self.log = tk.Text(
@@ -1191,10 +1135,7 @@ class App(tk.Tk):
 
         self.log.configure(state='normal')
         self.log.delete('1.0', 'end')
-        self.log.insert(
-            'end',
-            '\n'.join(self.log_lines)
-        )
+        self.log.insert('end', '\n'.join(self.log_lines))
         self.log.see('end')
         self.log.configure(state='disabled')
 
@@ -1236,16 +1177,9 @@ class App(tk.Tk):
         ):
             try:
                 image, layout, meta = make_mask(cells)
-                self.update_mask_window(
-                    cells,
-                    image,
-                    meta
-                )
+                self.update_mask_window(cells, image, meta)
             except Exception as exc:
-                self.show_exception(
-                    'Mask preview failed',
-                    exc
-                )
+                self.show_exception('Mask preview failed', exc)
 
     def update_mask_window(self, cells, image, meta):
         if (
@@ -1262,16 +1196,10 @@ class App(tk.Tk):
         except AttributeError:
             resample = Image.NEAREST
 
-        preview = image.convert('RGB').resize(
-            (600, 600),
-            resample
-        )
+        preview = image.convert('RGB').resize((600, 600), resample)
         photo = ImageTk.PhotoImage(preview)
 
-        label = ttk.Label(
-            self.mask_window,
-            image=photo
-        )
+        label = ttk.Label(self.mask_window, image=photo)
         label.image = photo
         label.pack(padx=8, pady=8)
 
@@ -1293,9 +1221,7 @@ class App(tk.Tk):
             raise ValueError('Cells must be an integer.')
 
         if not 1 <= value <= MAX_CELLS:
-            raise ValueError(
-                f'Cells must be 1..{MAX_CELLS}.'
-            )
+            raise ValueError(f'Cells must be 1..{MAX_CELLS}.')
 
         return value
 
@@ -1315,14 +1241,10 @@ class App(tk.Tk):
             raise ValueError('Leak must be 0..<0.5.')
 
         if not 0 <= noise <= 1:
-            raise ValueError(
-                'Noise sigma must be 0..1.'
-            )
+            raise ValueError('Noise sigma must be 0..1.')
 
         if not 0 <= ambient <= 0.5:
-            raise ValueError(
-                'Ambient IR must be 0..0.5.'
-            )
+            raise ValueError('Ambient IR must be 0..0.5.')
 
         ito = ITOPlate(
             enabled=self.ito_enabled.get(),
@@ -1358,18 +1280,10 @@ class App(tk.Tk):
             self.delay = int(self.vars['delay'].get())
 
             if mode == 'pow':
-                self.difficulty = int(
-                    self.vars['difficulty'].get()
-                )
-                self.nonce_start = int(
-                    self.vars['nonce_start'].get()
-                )
-                self.nonce_end = int(
-                    self.vars['nonce_end'].get()
-                )
-                self.timestamp = int(
-                    self.vars['timestamp'].get()
-                )
+                self.difficulty = int(self.vars['difficulty'].get())
+                self.nonce_start = int(self.vars['nonce_start'].get())
+                self.nonce_end = int(self.vars['nonce_end'].get())
+                self.timestamp = int(self.vars['timestamp'].get())
 
                 hash_text = ''.join(
                     self.vars['pre_pow_hash'].get().split()
@@ -1383,8 +1297,7 @@ class App(tk.Tk):
 
                 if not 1 <= self.difficulty <= MAX_DIFFICULTY:
                     raise ValueError(
-                        f'Difficulty must be '
-                        f'1..{MAX_DIFFICULTY}.'
+                        f'Difficulty must be 1..{MAX_DIFFICULTY}.'
                     )
 
                 self.job = pow_job(
@@ -1401,21 +1314,13 @@ class App(tk.Tk):
                 self.job = self.truth_job()
 
             elif mode == 'add':
-                x_value = int(
-                    self.vars['nonce_start'].get()
-                )
-                y_value = int(
-                    self.vars['nonce_end'].get()
-                )
+                x_value = int(self.vars['nonce_start'].get())
+                y_value = int(self.vars['nonce_end'].get())
 
                 if x_value < 0 or y_value < 0:
-                    raise ValueError(
-                        'X and Y must be non-negative.'
-                    )
+                    raise ValueError('X and Y must be non-negative.')
 
-                width = (
-                    x_value + y_value
-                ).bit_length() + 1
+                width = (x_value + y_value).bit_length() + 1
 
                 self.job = optical_add(
                     self.bench,
@@ -1431,10 +1336,7 @@ class App(tk.Tk):
         except Exception as exc:
             self.job = None
             self.set_ui_running(False)
-            self.show_exception(
-                'Could not start',
-                exc
-            )
+            self.show_exception('Could not start', exc)
 
     def truth_job(self):
         n = self.bench.cells
@@ -1442,25 +1344,15 @@ class App(tk.Tk):
 
         for start in range(0, 8, n):
             ids = list(range(start, min(8, start + n)))
-            inputs = []
-
-            for value in ids:
-                inputs.append((
-                    (value >> 2) & 1,
-                    (value >> 1) & 1,
-                    value & 1,
-                ))
-
-            inputs += [(0, 0, 0)] * (n - len(ids))
-            active = [
-                i < len(ids)
-                for i in range(n)
+            inputs = [
+                ((v >> 2) & 1, (v >> 1) & 1, v & 1)
+                for v in ids
             ]
 
-            decoded = self.bench.capture(
-                inputs,
-                active
-            )
+            inputs += [(0, 0, 0)] * (n - len(ids))
+            active = [i < len(ids) for i in range(n)]
+
+            decoded = self.bench.capture(inputs, active)
 
             yield {
                 'bit': 0,
@@ -1477,22 +1369,16 @@ class App(tk.Tk):
 
                 if decoded[lane]['k'] != expected:
                     raise RuntimeError(
-                        f'Truth-table failure for '
-                        f'{inputs[lane]}.'
+                        f'Truth-table failure for {inputs[lane]}.'
                     )
 
                 tested += 1
 
-        return (
-            f'All {tested} full-adder combinations passed.'
-        )
+        return f'All {tested} full-adder combinations passed.'
 
     def run_cpu_test(self):
         try:
-            result = cpu_pow_test(
-                difficulty=12,
-                max_nonce=100_000
-            )
+            result = cpu_pow_test(difficulty=12, max_nonce=100_000)
 
             if result['found']:
                 self.say(
@@ -1500,28 +1386,19 @@ class App(tk.Tk):
                     f'nonce {result["nonce"]}, '
                     f'{result["zeros"]} leading zero bits.'
                 )
-                self.say(
-                    f'Digest: {result["digest"]}'
-                )
+                self.say(f'Digest: {result["digest"]}')
             else:
-                self.say(
-                    'CPU test: no nonce found in diagnostic range.'
-                )
+                self.say('CPU test: no nonce found in diagnostic range.')
 
             self.say(
                 f'CPU test: {result["hashes"]:,} hashes in '
                 f'{result["seconds"]:.3f} s = '
                 f'{result["hash_rate"]:,.0f} H/s.'
             )
-            self.status.set(
-                'CPU kHeavyHash test complete.'
-            )
+            self.status.set('CPU kHeavyHash test complete.')
 
         except Exception as exc:
-            self.show_exception(
-                'CPU kHeavyHash test failed',
-                exc
-            )
+            self.show_exception('CPU kHeavyHash test failed', exc)
 
     def tick(self):
         if self.job is None:
@@ -1532,15 +1409,13 @@ class App(tk.Tk):
             self.last_camera = self.bench.last
 
             if 'stage' in event:
-                self.cell_labels = [
-                    event['stage']
-                ] * self.bench.cells
+                self.cell_labels = [event['stage']] * self.bench.cells
 
             self.status.set(
                 f'{self.mode}: {self.bench.cells} cells | '
                 f'exposures {self.bench.exposures:,} | '
-                f'{self.bench.exposure_seconds:.3f} s at '
-                f'{EXPOSURE_TIME_MS:.1f} ms/exposure | '
+                f'{self.bench.exposure_seconds:.13f} s at '
+                f'{EXPOSURE_TIME_MS:.12f} ms/exposure | '
                 f'bit {event["bit"] + 1}/{event["width"]} | '
                 f'margin {self.bench.worst_margin:.2f} | '
                 f'{event.get("stage", "")}'
@@ -1559,23 +1434,20 @@ class App(tk.Tk):
                         f'nonce {result["nonce"]}, '
                         f'{result["zeros"]} leading zero bits.'
                     )
-                    self.say(
-                        f'Digest: {result["digest"]}'
-                    )
+                    self.say(f'Digest: {result["digest"]}')
                 else:
-                    message = (
-                        'No valid nonce found in range.'
-                    )
+                    message = 'No valid nonce found in range.'
 
                 message += (
                     f' | {result["hashes"]:,} kHeavyHash hashes | '
                     f'{result["exposure_hash_rate"]:,.0f} H/s '
-                    f'at {EXPOSURE_TIME_MS:.1f} ms/exposure | '
+                    f'at {EXPOSURE_TIME_MS:.12f} ms/exposure | '
                     f'{result["exposures"]:,} optical exposures | '
-                    f'{result["exposure_seconds"]:.3f} s '
+                    f'{result["exposure_seconds"]:.13f} s '
                     f'exposure time | '
                     f'{result["exposures_per_hash"]:.3f} '
-                    f'exposures/hash.'
+                    f'exposures/hash | '
+                    f'CPU {result["cpu_hash_rate"]:,.0f} H/s.'
                 )
 
                 self.say(message)
@@ -1587,21 +1459,14 @@ class App(tk.Tk):
                 for value in result:
                     counts[value] = counts.get(value, 0) + 1
 
-                most_common = max(
-                    counts.items(),
-                    key=lambda item: item[1]
-                )
+                most_common = max(counts.items(), key=lambda item: item[1])
 
-                x_value = int(
-                    self.vars['nonce_start'].get()
-                )
-                y_value = int(
-                    self.vars['nonce_end'].get()
-                )
+                x_value = int(self.vars['nonce_start'].get())
+                y_value = int(self.vars['nonce_end'].get())
 
                 message = (
-                    f'Optical sum: {x_value} + '
-                    f'{y_value} = {most_common[0]} '
+                    f'Optical sum: {x_value} + {y_value} = '
+                    f'{most_common[0]} '
                     f'({most_common[1]}/{len(result)} lanes agree).'
                 )
 
@@ -1617,10 +1482,7 @@ class App(tk.Tk):
         except Exception as exc:
             self.job = None
             self.set_ui_running(False)
-            self.show_exception(
-                'PoW/bench stopped',
-                exc
-            )
+            self.show_exception('PoW/bench stopped', exc)
 
     def finish_job(self):
         self.job = None
@@ -1640,9 +1502,7 @@ class App(tk.Tk):
             self.job.close()
             self.finish_job()
             self.status.set('Stopped.')
-            self.say(
-                'Stopped by user. No completed-run result.'
-            )
+            self.say('Stopped by user. No completed-run result.')
 
     def show_mask(self, cells=None):
         try:
@@ -1666,21 +1526,12 @@ class App(tk.Tk):
                 self.mask_window.destroy()
 
             self.mask_window = tk.Toplevel(self)
-            self.mask_window.title(
-                '20 x 20 mm IR-bench mask'
-            )
+            self.mask_window.title('20 x 20 mm IR-bench mask')
 
-            self.update_mask_window(
-                cells,
-                image,
-                meta
-            )
+            self.update_mask_window(cells, image, meta)
 
         except Exception as exc:
-            self.show_exception(
-                'Mask export failed',
-                exc
-            )
+            self.show_exception('Mask export failed', exc)
 
     def draw(self):
         canvas = self.canvas
@@ -1688,21 +1539,13 @@ class App(tk.Tk):
 
         width = max(450, canvas.winfo_width())
         cells = self.display_cells
-        columns = min(
-            cells,
-            max(1, int(width / 260))
-        )
+        columns = min(cells, max(1, int(width / 260)))
         rows = math.ceil(cells / columns)
         cell_width = (width - 24) / columns
         cell_height = 150
 
         canvas.configure(
-            scrollregion=(
-                0,
-                0,
-                width,
-                rows * cell_height + 40
-            )
+            scrollregion=(0, 0, width, rows * cell_height + 40)
         )
 
         for i in range(cells):
@@ -1720,10 +1563,7 @@ class App(tk.Tk):
 
             title = f'Cell {i + 1}'
 
-            if (
-                i < len(self.cell_labels)
-                and self.cell_labels[i]
-            ):
+            if i < len(self.cell_labels) and self.cell_labels[i]:
                 title += f'  {self.cell_labels[i]}'
 
             canvas.create_text(
