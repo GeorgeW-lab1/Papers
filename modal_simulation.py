@@ -1,23 +1,29 @@
-
 #!/usr/bin/env python3
 """
 Interactive Logical Composure Questionnaire + Kripke Model Simulator
+with 25 Risk-Based Assessments
 
 Run:
-    python modal_sim.py
+python modal_simulation.py
 
 Features:
-    - Interactive Y/N questionnaire
-    - Review and edit answers
-    - Run simulation
-    - Kripke model search
-    - Minimal repair branches
-    - Year-10 outlook
+- Interactive Y/N questionnaire
+- Review and edit answers
+- Logical composure tests
+- Kripke model search
+- Minimal repair branches
+- Year-10 outlook
+- 25-question weighted risk assessment
 """
 
 from itertools import combinations
 
-QUESTIONS = [
+
+# ==========================================================
+# QUESTIONS
+# ==========================================================
+
+LOGIC_QUESTIONS = [
     "Planning ahead usually beats improvising.",
     "Improvising usually beats planning.",
     "If I commit to a goal, I will reach it. (C -> G)",
@@ -27,6 +33,66 @@ QUESTIONS = [
     "More than one very different future is possible. (diamond)",
     "Some parts of my 10-year future are certain. (box)"
 ]
+
+
+RISK_QUESTIONS = [
+    # Risk identification
+    "I regularly identify what could go wrong before starting a major task.",
+    "When a plan changes, I reassess the risks before acting.",
+    "I distinguish between a real risk and an unlikely worst-case scenario.",
+    "I consider how likely an adverse event is, not merely how severe it could be.",
+    "I identify the most damaging outcome before committing to a decision.",
+
+    # Exposure and limits
+    "I set a limit on how much time, money, or effort I am willing to lose.",
+    "I avoid commitments whose downside I cannot tolerate.",
+    "I prepare a fallback option for important plans.",
+    "I know what evidence would make me change my plan.",
+    "I review progress often enough to detect problems early.",
+
+    # Decision discipline
+    "I avoid relying on a single assumption for an important outcome.",
+    "I consider second-order effects, such as how others may respond.",
+    "I seek information from people likely to disagree with me.",
+    "I recognise when I am operating outside my area of competence.",
+    "I avoid making irreversible decisions under time pressure.",
+
+    # Bias and judgement
+    "I separate decisions that can be reversed from those that cannot.",
+    "I consider whether my incentives could bias my judgement.",
+    "I check whether optimism is causing me to underestimate risks.",
+    "I consider whether fear is causing me to overestimate risks.",
+    "I use past results as evidence, but I do not assume they guarantee future results.",
+
+    # Monitoring and adaptation
+    "I update my beliefs when credible new evidence appears.",
+    "I document key assumptions so they can be tested later.",
+    "I assign responsibility for monitoring each major risk.",
+    "I know when to stop, pause, or exit a deteriorating situation.",
+    "I treat uncertainty as a reason to build resilience, not a reason to avoid all action."
+]
+
+
+QUESTIONS = LOGIC_QUESTIONS + RISK_QUESTIONS
+
+
+RISK_WEIGHTS = [
+    3, 3, 3, 3, 4,       # Risk identification
+    4, 4, 3, 3, 3,       # Exposure and limits
+    4, 3, 3, 4, 4,       # Decision discipline
+    3, 3, 3, 3, 3,       # Bias and judgement
+    4, 3, 3, 4, 4        # Monitoring and adaptation
+]
+
+
+RISK_CATEGORIES = {
+    "Risk identification": (0, 5),
+    "Exposure and limits": (5, 10),
+    "Decision discipline": (10, 15),
+    "Bias and judgement": (15, 20),
+    "Monitoring and adaptation": (20, 25)
+}
+
 
 WORLDS = {
     "w1": (1, 1),
@@ -112,14 +178,78 @@ def repairs(a, max_flips=3):
             if ms and all(composure(b).values()):
                 found.append((idx, b, ms))
 
-        if found:
-            return found
-
     return found
 
 
 # ==========================================================
-# PROJECTION
+# RISK ASSESSMENT ENGINE
+# ==========================================================
+
+def risk_assessment(a):
+    risk_answers = a[8:33]
+
+    weighted_yes = sum(
+        weight
+        for answer, weight in zip(risk_answers, RISK_WEIGHTS)
+        if answer
+    )
+
+    maximum = sum(RISK_WEIGHTS)
+    percentage = round((weighted_yes / maximum) * 100)
+
+    if percentage >= 85:
+        band = "Very strong risk discipline"
+    elif percentage >= 70:
+        band = "Strong risk discipline"
+    elif percentage >= 55:
+        band = "Moderate risk discipline"
+    elif percentage >= 40:
+        band = "Developing risk discipline"
+    else:
+        band = "High risk exposure"
+
+    category_results = {}
+
+    for category, (start, end) in RISK_CATEGORIES.items():
+        answers = risk_answers[start:end]
+        weights = RISK_WEIGHTS[start:end]
+
+        earned = sum(
+            weight
+            for answer, weight in zip(answers, weights)
+            if answer
+        )
+
+        possible = sum(weights)
+
+        category_results[category] = {
+            "earned": earned,
+            "possible": possible,
+            "percentage": round((earned / possible) * 100)
+        }
+
+    priority_gaps = []
+
+    for i, (question, answer, weight) in enumerate(
+        zip(RISK_QUESTIONS, risk_answers, RISK_WEIGHTS)
+    ):
+        if not answer and weight >= 4:
+            priority_gaps.append(
+                f"Q{9 + i}: {question}"
+            )
+
+    return {
+        "earned": weighted_yes,
+        "maximum": maximum,
+        "percentage": percentage,
+        "band": band,
+        "categories": category_results,
+        "priority_gaps": priority_gaps
+    }
+
+
+# ==========================================================
+# MODEL DESCRIPTION HELPERS
 # ==========================================================
 
 def describe(model):
@@ -164,7 +294,7 @@ def run(a):
         lines.append(s)
 
     out("=" * 65)
-    out("       LOGICAL COMPOSURE / KRIPKE MODEL SIMULATION")
+    out(" LOGICAL COMPOSURE / KRIPKE MODEL SIMULATION")
     out("=" * 65)
 
     out("\nAnswers: " + bits(a))
@@ -174,45 +304,78 @@ def run(a):
     tests = composure(a)
 
     for name, ok in tests.items():
-        out(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+        out(f" [{'PASS' if ok else 'FAIL'}] {name}")
 
     score = sum(tests.values())
 
-    out(f"\n  Composure score: {score}/4 ({score * 25}%)")
+    out(f"\n Composure score: {score}/4 ({score * 25}%)")
+
+    out("\n== RISK-BASED ASSESSMENT ==")
+
+    risk = risk_assessment(a)
+
+    out(
+        f" Risk score: {risk['earned']}/{risk['maximum']} "
+        f"({risk['percentage']}%)"
+    )
+    out(f" Assessment: {risk['band']}")
+
+    out("\n Risk-category breakdown:")
+
+    for category, result in risk["categories"].items():
+        out(
+            f" - {category}: "
+            f"{result['earned']}/{result['possible']} "
+            f"({result['percentage']}%)"
+        )
+
+    if risk["priority_gaps"]:
+        out("\n Priority development areas:")
+
+        for gap in risk["priority_gaps"]:
+            out(f" - {gap}")
+    else:
+        out("\n No high-weight risk-control gaps identified.")
 
     out("\n== KRIPKE MODEL SEARCH ==")
 
     ms = find_models(a)
 
-    out("  Candidate world-sets: 15")
+    out(" Candidate world-sets: 15")
 
     if ms:
-        out(f"  CONSISTENT: {len(ms)} model(s) satisfy all answers.")
+        out(
+            f" CONSISTENT: {len(ms)} model(s) "
+            "satisfy all logic answers."
+        )
 
         for model in ms:
-            out(f"    {fmt(model)} -> {describe(model)}")
+            out(f" {fmt(model)} -> {describe(model)}")
 
     else:
-        out("  INCONSISTENT: no world-set satisfies all answers.")
+        out(
+            " INCONSISTENT: no world-set satisfies "
+            "all logic answers."
+        )
 
-        out("\n== MINIMAL REPAIR BRANCHES ==")
+    out("\n== MINIMAL REPAIR BRANCHES ==")
 
-        rs = repairs(a)
+    rs = repairs(a)
 
-        if not rs:
-            out("  No repair within 3 answer flips.")
+    if not rs:
+        out(" No repair within 3 answer flips.")
 
-        for idx, b, models in rs:
-            changes = ", ".join(
-                f"Q{i+1}: {'Y' if a[i] else 'N'}"
-                f" -> {'Y' if b[i] else 'N'}"
-                for i in idx
-            )
+    for idx, b, models in rs:
+        changes = ", ".join(
+            f"Q{i + 1}: {'Y' if a[i] else 'N'}"
+            f" -> {'Y' if b[i] else 'N'}"
+            for i in idx
+        )
 
-            out(f"\n  Change {changes}")
+        out(f"\n Change {changes}")
 
-            for model in models:
-                out(f"    {fmt(model)} -> {describe(model)}")
+        for model in models:
+            out(f" {fmt(model)} -> {describe(model)}")
 
     out("\n== YEAR-10 OUTLOOK ==")
 
@@ -231,14 +394,20 @@ def run(a):
 
         n_goal = sum(WORLDS[w][1] for w in worlds_seen)
 
-        out("  Possible worlds: " + ", ".join(worlds_seen))
-        out(f"  Goal reached in {n_goal}/{len(worlds_seen)} possible worlds.")
+        out(" Possible worlds: " + ", ".join(worlds_seen))
+        out(
+            f" Goal reached in {n_goal}/{len(worlds_seen)} "
+            "possible worlds."
+        )
 
     else:
-        out("  No outlook available.")
+        out(" No outlook available.")
 
     out("\n" + "=" * 65)
-    out("Formal consequences of the answers, not a real-world forecast.")
+    out(
+        "Formal consequences of the answers and a self-reported "
+        "risk profile, not a real-world forecast."
+    )
     out("=" * 65)
 
     return "\n".join(lines)
@@ -250,11 +419,15 @@ def run(a):
 
 def ask(question, number, previous=None):
     while True:
-        suffix = f" [current: {'Y' if previous else 'N'}]" if previous is not None else ""
+        suffix = (
+            f" [current: {'Y' if previous else 'N'}]"
+            if previous is not None
+            else ""
+        )
 
         answer = input(
             f"\nQ{number}. {question}{suffix}\n"
-            "     [Y] Yes  [N] No  [B] Back  [Q] Quit: "
+            " [Y] Yes [N] No [B] Back [Q] Quit: "
         ).strip().upper()
 
         if answer in ("Y", "N"):
@@ -264,9 +437,14 @@ def ask(question, number, previous=None):
             return "BACK"
 
         if answer == "Q":
-            raise SystemExit("\nQuestionnaire terminated.")
+            raise SystemExit(
+                "\nQuestionnaire terminated."
+            )
 
-        print("Invalid input. Enter Y, N, B, or Q.")
+        print(
+            "Invalid input. "
+            "Enter Y, N, B, or Q."
+        )
 
 
 def questionnaire():
@@ -274,10 +452,12 @@ def questionnaire():
     index = 0
 
     print("\n" + "=" * 65)
-    print("          LOGICAL COMPOSURE QUESTIONNAIRE")
+    print(" LOGICAL COMPOSURE AND RISK QUESTIONNAIRE")
     print("=" * 65)
 
     print("\nAnswer each statement with Y or N.")
+    print("Questions 1-8 assess logical composure.")
+    print("Questions 9-33 assess risk-based judgement.")
     print("You can enter B to return to the previous question.")
     print("You can enter Q to quit.")
 
@@ -293,6 +473,7 @@ def questionnaire():
                 index -= 1
             else:
                 print("Already at the first question.")
+
             continue
 
         answers[index] = answer
@@ -304,35 +485,50 @@ def questionnaire():
 def review(answers):
     while True:
         print("\n" + "=" * 65)
-        print("                  ANSWER REVIEW")
+        print(" ANSWER REVIEW")
         print("=" * 65)
 
         for i, (question, answer) in enumerate(
             zip(QUESTIONS, answers), 1
         ):
             print(
-                f"\n  Q{i}. {question}\n"
-                f"      Answer: {'YES' if answer else 'NO'}"
+                f"\n Q{i}. {question}\n"
+                f" Answer: {'YES' if answer else 'NO'}"
             )
 
         print("\n[E] Edit answer")
         print("[R] Run simulation")
         print("[Q] Quit")
 
-        choice = input("\nSelection: ").strip().upper()
+        choice = input(
+            "\nSelection: "
+        ).strip().upper()
 
         if choice == "E":
             while True:
                 try:
-                    number = int(input("Question number (1-8): "))
-                    if 1 <= number <= 8:
+                    number = int(
+                        input(
+                            f"Question number "
+                            f"(1-{len(QUESTIONS)}): "
+                        )
+                    )
+
+                    if 1 <= number <= len(QUESTIONS):
                         break
+
                 except ValueError:
                     pass
 
-                print("Enter a number from 1 to 8.")
+                print(
+                    f"Enter a number from 1 to "
+                    f"{len(QUESTIONS)}."
+                )
 
-            answer = ask(QUESTIONS[number - 1], number)
+            answer = ask(
+                QUESTIONS[number - 1],
+                number
+            )
 
             if answer != "BACK":
                 answers[number - 1] = answer
@@ -341,7 +537,9 @@ def review(answers):
             return answers
 
         elif choice == "Q":
-            raise SystemExit("\nSimulation terminated.")
+            raise SystemExit(
+                "\nSimulation terminated."
+            )
 
         else:
             print("Invalid selection.")
